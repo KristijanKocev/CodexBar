@@ -1052,6 +1052,10 @@ public enum ClaudeOAuthCredentialsStore {
                             persistentRefHash: persistentRefHash))
                     return data
                 }
+                // Candidate found but data was nil/empty. Do NOT fall through to legacy query - the two query shapes
+                // (persistentRef vs service) require separate ACL authorization on some macOS configurations.
+                // Falling through would cause a second keychain prompt even after the user clicked "Always Allow".
+                throw ClaudeOAuthCredentialsError.notFound
             } catch let error as ClaudeOAuthCredentialsError {
                 if case .keychainError = error {
                     ClaudeOAuthKeychainAccessGate.recordDenied()
@@ -1060,7 +1064,8 @@ public enum ClaudeOAuthCredentialsStore {
             }
         }
 
-        // Fallback: legacy query (may pick an arbitrary duplicate).
+        // Fallback: legacy query - only used when no candidates were found via the modern query.
+        // This avoids double-prompting: if candidates exist, we use them exclusively (see above).
         do {
             if let data = try self.loadClaudeKeychainLegacyData(
                 allowKeychainPrompt: allowKeychainPrompt,
@@ -1562,10 +1567,17 @@ extension ClaudeOAuthCredentialsStore {
         }
 
         // Consult only the newest candidate to avoid syncing from a different keychain entry (e.g. old login).
-        if let candidate = self.claudeKeychainCandidatesWithoutPrompt(promptMode: fallbackPromptMode).first,
-           let data = try? self.loadClaudeKeychainData(candidate: candidate, allowKeychainPrompt: false),
-           !data.isEmpty
-        {
+        let candidates = self.claudeKeychainCandidatesWithoutPrompt(promptMode: fallbackPromptMode)
+        if let candidate = candidates.first {
+            guard let data = try? self.loadClaudeKeychainData(candidate: candidate, allowKeychainPrompt: false),
+                  !data.isEmpty
+            else {
+                // Candidate found but data was nil/empty. Do NOT fall through to legacy query - the two query shapes
+                // (persistentRef vs service) require separate ACL authorization on some macOS configurations.
+                // Falling through would cause a second keychain prompt even after the user clicked "Always Allow".
+                return false
+            }
+
             let fingerprint = ClaudeKeychainFingerprint(
                 modifiedAt: candidate.modifiedAt.map { Int($0.timeIntervalSince1970) },
                 createdAt: candidate.createdAt.map { Int($0.timeIntervalSince1970) },
@@ -1582,8 +1594,11 @@ extension ClaudeOAuthCredentialsStore {
 
             // Fingerprint so we don't repeatedly hammer a broken/expired keychain item during background retries.
             self.saveClaudeKeychainFingerprint(fingerprint)
+            return false
         }
 
+        // Legacy fallback - only used when no candidates were found via the modern query.
+        // This avoids double-prompting: if candidates exist, we use them exclusively (see above).
         let legacyData = try? self.loadClaudeKeychainLegacyData(
             allowKeychainPrompt: false,
             promptMode: fallbackPromptMode)

@@ -56,23 +56,27 @@ Prompt mitigation:
 - Background cache-sync-on-change also performs non-interactive Claude keychain probes (`syncWithClaudeKeychainIfChanged`)
   and can update cached OAuth data when the token changes.
 
-### Why two Claude keychain prompts can still happen on startup
+### Claude keychain prompt behavior (fixed)
 When CodexBar does not have usable OAuth credentials in its own cache (`com.steipete.codexbar.cache` / `oauth.claude`),
 bootstrap falls through to Claude CLI keychain reads.
 
-Current flow can perform up to two interactive reads in one bootstrap call:
-1. Interactive read of the newest discovered keychain candidate.
-2. If that does not return usable data, interactive legacy service-level fallback read.
+The flow uses two query shapes:
+1. **persistentRef-based read**: Reads data using the persistent reference of a discovered keychain candidate.
+2. **service-based legacy read**: Reads data using only the service name (fallback for old keychain entries).
 
-On some macOS keychain/ACL states, pressing **Allow** (session-only) for the first read does not grant enough access
-for the second read shape, so macOS prompts again. Pressing **Always Allow** usually authorizes both query shapes for
-the app identity and avoids the immediate second prompt.
+**Previous behavior**: If the persistentRef-based read returned empty/nil, the code would fall through to the legacy
+service-based query. Because macOS authorizes each query shape separately, this could cause a second keychain prompt
+even after the user clicked "Always Allow" on the first prompt.
 
-The prompt copy differs because Security.framework is authorizing different operations:
-- one path is a direct secret-data read for the key item,
-- the fallback path is a key/service access query.
+**Current behavior**: When keychain candidates are discovered, only the persistentRef-based query is used. The legacy
+fallback is now reserved for cases where **no candidates** are found (e.g., very old keychain entries created before
+the multi-entry discovery code existed). This prevents the double-prompt scenario.
 
-This is OS/keychain ACL behavior, not a `ThisDeviceOnly` migration issue.
+If you still see repeated prompts:
+- Ensure you clicked **"Always Allow"** (not just "Allow") on the keychain prompt.
+- Check that you're using the latest CodexBar version with this fix.
+- The fix only applies to scenarios where candidates are found; if you have a very old keychain setup, one-time
+  prompts may still occur during migration.
 
 ### 3. Claude web cookie cache
 `Sources/CodexBarCore/CookieHeaderCache.swift` and `Sources/CodexBarCore/KeychainCacheStore.swift`
