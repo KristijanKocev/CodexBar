@@ -253,7 +253,7 @@ extension StatusItemController {
         if showBrandPercent,
            let brand = ProviderBrandIcon.image(for: primaryProvider)
         {
-            let displayText = self.menuBarDisplayText(for: primaryProvider, snapshot: snapshot)
+            let displayText = self.combinedMenuBarDisplayText()
             self.setButtonImage(brand, for: button)
             self.setButtonTitle(displayText, for: button)
             return
@@ -412,7 +412,8 @@ extension StatusItemController {
             provider: provider,
             percentWindow: percentWindow,
             paceWindow: snapshot?.secondary,
-            showUsed: self.settings.usageBarsShowUsed)
+            showUsed: self.settings.usageBarsShowUsed,
+            cursorRequests: snapshot?.cursorRequests)
 
         let sessionExhausted = (snapshot?.primary?.remainingPercent ?? 100) <= 0
         let weeklyExhausted = (snapshot?.secondary?.remainingPercent ?? 100) <= 0
@@ -430,6 +431,41 @@ extension StatusItemController {
         }
 
         return displayText
+    }
+
+    func combinedMenuBarDisplayText() -> String? {
+        let primaryProvider = self.primaryProviderForUnifiedIcon()
+        let primarySnapshot = self.store.snapshot(for: primaryProvider)
+        let primaryText = self.menuBarDisplayText(for: primaryProvider, snapshot: primarySnapshot)
+
+        let secondaryProvider: UsageProvider? = {
+            if let explicit = self.settings.secondarySelectedMenuProvider,
+               explicit != primaryProvider,
+               self.store.isEnabled(explicit)
+            {
+                return explicit
+            }
+            let enabled = self.store.enabledProviders()
+            return enabled.first { $0 != primaryProvider }
+        }()
+
+        guard let secondaryProvider else {
+            return primaryText
+        }
+
+        let secondarySnapshot = self.store.snapshot(for: secondaryProvider)
+        let secondaryText = self.menuBarDisplayText(for: secondaryProvider, snapshot: secondarySnapshot)
+
+        switch (primaryText, secondaryText) {
+        case let (primary?, secondary?):
+            return "\(primary) | \(secondary)"
+        case let (primary?, nil):
+            return primary
+        case let (nil, secondary?):
+            return secondary
+        case (nil, nil):
+            return nil
+        }
     }
 
     private func menuBarPercentWindow(for provider: UsageProvider, snapshot: UsageSnapshot?) -> RateWindow? {

@@ -317,7 +317,15 @@ elif [[ "$ALLOW_LLDB" == "1" ]]; then
   CODESIGN_ARGS=(--force --sign "$CODESIGN_ID")
 else
   CODESIGN_ID="${APP_IDENTITY:-Developer ID Application: Peter Steinberger (Y5PE65HELJ)}"
-  CODESIGN_ARGS=(--force --timestamp --options runtime --sign "$CODESIGN_ID")
+  # Self-signed certificates (like "CodexBar Development") don't have Team IDs,
+  # so we can't use --options runtime (Hardened Runtime enforces Team ID matching).
+  # Only use runtime hardening for Apple-issued Developer ID/Development certificates.
+  if [[ "$CODESIGN_ID" == *"Developer ID"* ]] || [[ "$CODESIGN_ID" == *"Apple Development"* ]] || [[ "$CODESIGN_ID" == *"Apple Distribution"* ]]; then
+    CODESIGN_ARGS=(--force --timestamp --options runtime --sign "$CODESIGN_ID")
+  else
+    # Self-signed certificate: skip runtime hardening to avoid Team ID mismatch
+    CODESIGN_ARGS=(--force --sign "$CODESIGN_ID")
+  fi
 fi
 function resign() { codesign "${CODESIGN_ARGS[@]}" "$1"; }
   # Sign innermost binaries first, then the framework root to seal resources

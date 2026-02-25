@@ -297,6 +297,25 @@ extension SettingsStore {
         }
     }
 
+    private var secondarySelectedMenuProviderRaw: String? {
+        get { self.defaultsState.secondarySelectedMenuProviderRaw }
+        set {
+            self.defaultsState.secondarySelectedMenuProviderRaw = newValue
+            if let raw = newValue {
+                self.userDefaults.set(raw, forKey: "secondarySelectedMenuProvider")
+            } else {
+                self.userDefaults.removeObject(forKey: "secondarySelectedMenuProvider")
+            }
+        }
+    }
+
+    var secondarySelectedMenuProvider: UsageProvider? {
+        get { self.secondarySelectedMenuProviderRaw.flatMap(UsageProvider.init(rawValue:)) }
+        set {
+            self.secondarySelectedMenuProviderRaw = newValue?.rawValue
+        }
+    }
+
     var providerDetectionCompleted: Bool {
         get { self.defaultsState.providerDetectionCompleted }
         set {

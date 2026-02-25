@@ -1,8 +1,10 @@
+import CodexBarCore
 import SwiftUI
 
 @MainActor
 struct DisplayPane: View {
     @Bindable var settings: SettingsStore
+    @Bindable var store: UsageStore
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: true) {
@@ -44,6 +46,27 @@ struct DisplayPane: View {
                         Picker("Display mode", selection: self.$settings.menuBarDisplayMode) {
                             ForEach(MenuBarDisplayMode.allCases) { mode in
                                 Text(mode.label).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: 200)
+                    }
+                    .disabled(!self.settings.menuBarShowsBrandIconWithPercent)
+                    .opacity(self.settings.menuBarShowsBrandIconWithPercent ? 1 : 0.5)
+                    HStack(alignment: .top, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Secondary provider")
+                                .font(.body)
+                            Text("Show a second provider in the menu bar alongside the primary.")
+                                .font(.footnote)
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
+                        Picker("Secondary provider", selection: self.$settings.secondarySelectedMenuProvider) {
+                            Text("Automatic").tag(UsageProvider?.none)
+                            ForEach(self.store.enabledProviders(), id: \.self) { provider in
+                                Text(self.store.metadata(for: provider).displayName).tag(UsageProvider?.some(provider))
                             }
                         }
                         .labelsHidden()

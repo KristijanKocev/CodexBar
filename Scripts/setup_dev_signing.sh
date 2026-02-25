@@ -49,13 +49,20 @@ openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 \
     -nodes -keyout /tmp/codexbar-dev.key -out /tmp/codexbar-dev.crt \
     -config "$TEMP_CONFIG" 2>/dev/null
 
-# Convert to PKCS12 format
-openssl pkcs12 -export -out /tmp/codexbar-dev.p12 \
+# Convert to PKCS12 format (use legacy algorithms for macOS Keychain compatibility)
+# OpenSSL 3.x requires explicit legacy flags for macOS security import
+if ! openssl pkcs12 -export -out /tmp/codexbar-dev.p12 \
     -inkey /tmp/codexbar-dev.key -in /tmp/codexbar-dev.crt \
-    -passout pass: 2>/dev/null
+    -passout pass: \
+    -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg SHA1 2>/dev/null; then
+  # Fallback for older OpenSSL versions
+  openssl pkcs12 -export -out /tmp/codexbar-dev.p12 \
+      -inkey /tmp/codexbar-dev.key -in /tmp/codexbar-dev.crt \
+      -passout pass: 2>/dev/null
+fi
 
-# Import into keychain
-security import /tmp/codexbar-dev.p12 -k ~/Library/Keychains/login.keychain-db -T /usr/bin/codesign -T /usr/bin/security
+# Import into keychain (use -P "" to specify empty password non-interactively)
+security import /tmp/codexbar-dev.p12 -k ~/Library/Keychains/login.keychain-db -P "" -T /usr/bin/codesign -T /usr/bin/security
 
 # Clean up temporary files
 rm -f /tmp/codexbar-dev.{key,crt,p12}

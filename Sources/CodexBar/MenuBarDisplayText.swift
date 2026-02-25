@@ -9,6 +9,11 @@ enum MenuBarDisplayText {
         return String(format: "%.0f%%", clamped)
     }
 
+    static func cursorRequestText(cursorRequests: CursorRequestUsage?, showUsed: Bool) -> String? {
+        guard let requests = cursorRequests else { return nil }
+        return "\(requests.used)/\(requests.limit)"
+    }
+
     static func paceText(provider: UsageProvider, window: RateWindow?, now: Date = .init()) -> String? {
         guard let window else { return nil }
         guard let pace = UsagePaceText.weeklyPace(provider: provider, window: window, now: now) else { return nil }
@@ -23,15 +28,25 @@ enum MenuBarDisplayText {
         percentWindow: RateWindow?,
         paceWindow: RateWindow?,
         showUsed: Bool,
+        cursorRequests: CursorRequestUsage? = nil,
         now: Date = .init()) -> String?
     {
         switch mode {
         case .percent:
+            if provider == .cursor, let requestText = self.cursorRequestText(cursorRequests: cursorRequests, showUsed: showUsed) {
+                return requestText
+            }
             return self.percentText(window: percentWindow, showUsed: showUsed)
         case .pace:
             return self.paceText(provider: provider, window: paceWindow, now: now)
         case .both:
-            guard let percent = percentText(window: percentWindow, showUsed: showUsed) else { return nil }
+            let percentPart: String?
+            if provider == .cursor, let requestText = self.cursorRequestText(cursorRequests: cursorRequests, showUsed: showUsed) {
+                percentPart = requestText
+            } else {
+                percentPart = percentText(window: percentWindow, showUsed: showUsed)
+            }
+            guard let percent = percentPart else { return nil }
             guard let pace = Self.paceText(provider: provider, window: paceWindow, now: now) else { return nil }
             return "\(percent) · \(pace)"
         }

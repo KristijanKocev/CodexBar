@@ -216,6 +216,7 @@ extension SettingsStore {
         let mergeIcons = userDefaults.object(forKey: "mergeIcons") as? Bool ?? true
         let switcherShowsIcons = userDefaults.object(forKey: "switcherShowsIcons") as? Bool ?? true
         let selectedMenuProviderRaw = userDefaults.string(forKey: "selectedMenuProvider")
+        let secondarySelectedMenuProviderRaw = userDefaults.string(forKey: "secondarySelectedMenuProvider")
         let providerDetectionCompleted = userDefaults.object(forKey: "providerDetectionCompleted") as? Bool ?? false
 
         return SettingsDefaultsState(
@@ -248,6 +249,7 @@ extension SettingsStore {
             mergeIcons: mergeIcons,
             switcherShowsIcons: switcherShowsIcons,
             selectedMenuProviderRaw: selectedMenuProviderRaw,
+            secondarySelectedMenuProviderRaw: secondarySelectedMenuProviderRaw,
             providerDetectionCompleted: providerDetectionCompleted)
     }
 }

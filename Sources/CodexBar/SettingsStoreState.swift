@@ -30,5 +30,6 @@ struct SettingsDefaultsState: Sendable {
     var mergeIcons: Bool
     var switcherShowsIcons: Bool
     var selectedMenuProviderRaw: String?
+    var secondarySelectedMenuProviderRaw: String?
     var providerDetectionCompleted: Bool
 }
