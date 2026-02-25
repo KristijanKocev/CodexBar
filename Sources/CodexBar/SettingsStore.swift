@@ -62,6 +62,7 @@ enum MenuBarMetricPreference: String, CaseIterable, Identifiable {
 @Observable
 final class SettingsStore {
     static let sharedDefaults = UserDefaults(suiteName: "group.com.steipete.codexbar")
+    static let mergedOverviewProviderLimit = 3
     static let isRunningTests: Bool = {
         let env = ProcessInfo.processInfo.environment
         if env["XCTestConfigurationFilePath"] != nil { return true }
@@ -112,8 +113,8 @@ final class SettingsStore {
             account: "amp-cookie",
             promptKind: .ampCookie),
         copilotTokenStore: any CopilotTokenStoring = KeychainCopilotTokenStore(),
-        tokenAccountStore: any ProviderTokenAccountStoring = FileTokenAccountStore())
-    {
+        tokenAccountStore: any ProviderTokenAccountStoring = FileTokenAccountStore()
+    ) {
         let legacyStores = CodexBarConfigMigrator.LegacyStores(
             zaiTokenStore: zaiTokenStore,
             syntheticTokenStore: syntheticTokenStore,
@@ -149,14 +150,16 @@ final class SettingsStore {
         self.applyTokenCostDefaultIfNeeded()
         if self.claudeUsageDataSource != .cli { self.claudeWebExtrasEnabled = false }
         self.openAIWebAccessEnabled = self.codexCookieSource.isEnabled
-        Self.sharedDefaults?.set(self.debugDisableKeychainAccess, forKey: "debugDisableKeychainAccess")
+        Self.sharedDefaults?.set(
+            self.debugDisableKeychainAccess, forKey: "debugDisableKeychainAccess")
         KeychainAccessGate.isDisabled = self.debugDisableKeychainAccess
     }
 }
 
 extension SettingsStore {
     private static func loadDefaultsState(userDefaults: UserDefaults) -> SettingsDefaultsState {
-        let refreshRaw = userDefaults.string(forKey: "refreshFrequency") ?? RefreshFrequency.fiveMinutes.rawValue
+        let refreshRaw =
+            userDefaults.string(forKey: "refreshFrequency") ?? RefreshFrequency.fiveMinutes.rawValue
         let refreshFrequency = RefreshFrequency(rawValue: refreshRaw) ?? .fiveMinutes
         let launchAtLogin = userDefaults.object(forKey: "launchAtLogin") as? Bool ?? false
         let debugMenuEnabled = userDefaults.object(forKey: "debugMenuEnabled") as? Bool ?? false
@@ -164,60 +167,92 @@ extension SettingsStore {
             if let stored = userDefaults.object(forKey: "debugDisableKeychainAccess") as? Bool {
                 return stored
             }
-            if let shared = Self.sharedDefaults?.object(forKey: "debugDisableKeychainAccess") as? Bool {
+            if let shared = Self.sharedDefaults?.object(forKey: "debugDisableKeychainAccess")
+                as? Bool
+            {
                 userDefaults.set(shared, forKey: "debugDisableKeychainAccess")
                 return shared
             }
             return false
         }()
-        let debugFileLoggingEnabled = userDefaults.object(forKey: "debugFileLoggingEnabled") as? Bool ?? false
-        let debugLogLevelRaw = userDefaults.string(forKey: "debugLogLevel") ?? CodexBarLog.Level.verbose.rawValue
+        let debugFileLoggingEnabled =
+            userDefaults.object(forKey: "debugFileLoggingEnabled") as? Bool ?? false
+        let debugLogLevelRaw =
+            userDefaults.string(forKey: "debugLogLevel") ?? CodexBarLog.Level.verbose.rawValue
         if userDefaults.string(forKey: "debugLogLevel") == nil {
             userDefaults.set(debugLogLevelRaw, forKey: "debugLogLevel")
         }
         let debugLoadingPatternRaw = userDefaults.string(forKey: "debugLoadingPattern")
-        let debugKeepCLISessionsAlive = userDefaults.object(forKey: "debugKeepCLISessionsAlive") as? Bool ?? false
-        let statusChecksEnabled = userDefaults.object(forKey: "statusChecksEnabled") as? Bool ?? true
-        let sessionQuotaDefault = userDefaults.object(forKey: "sessionQuotaNotificationsEnabled") as? Bool
+        let debugKeepCLISessionsAlive =
+            userDefaults.object(forKey: "debugKeepCLISessionsAlive") as? Bool ?? false
+        let statusChecksEnabled =
+            userDefaults.object(forKey: "statusChecksEnabled") as? Bool ?? true
+        let sessionQuotaDefault =
+            userDefaults.object(forKey: "sessionQuotaNotificationsEnabled") as? Bool
         let sessionQuotaNotificationsEnabled = sessionQuotaDefault ?? true
         if sessionQuotaDefault == nil {
             userDefaults.set(true, forKey: "sessionQuotaNotificationsEnabled")
         }
         let usageBarsShowUsed = userDefaults.object(forKey: "usageBarsShowUsed") as? Bool ?? false
-        let resetTimesShowAbsolute = userDefaults.object(forKey: "resetTimesShowAbsolute") as? Bool ?? false
-        let menuBarShowsBrandIconWithPercent = userDefaults.object(
-            forKey: "menuBarShowsBrandIconWithPercent") as? Bool ?? false
-        let menuBarDisplayModeRaw = userDefaults.string(forKey: "menuBarDisplayMode")
+        let resetTimesShowAbsolute =
+            userDefaults.object(forKey: "resetTimesShowAbsolute") as? Bool ?? false
+        let menuBarShowsBrandIconWithPercent =
+            userDefaults.object(
+                forKey: "menuBarShowsBrandIconWithPercent") as? Bool ?? false
+        let menuBarDisplayModeRaw =
+            userDefaults.string(forKey: "menuBarDisplayMode")
             ?? MenuBarDisplayMode.percent.rawValue
-        let showAllTokenAccountsInMenu = userDefaults.object(forKey: "showAllTokenAccountsInMenu") as? Bool ?? false
-        let storedPreferences = userDefaults.dictionary(forKey: "menuBarMetricPreferences") as? [String: String] ?? [:]
+        let showAllTokenAccountsInMenu =
+            userDefaults.object(forKey: "showAllTokenAccountsInMenu") as? Bool ?? false
+        let storedPreferences =
+            userDefaults.dictionary(forKey: "menuBarMetricPreferences") as? [String: String] ?? [:]
         var resolvedPreferences = storedPreferences
         if resolvedPreferences.isEmpty,
-           let menuBarMetricRaw = userDefaults.string(forKey: "menuBarMetricPreference"),
-           let legacyPreference = MenuBarMetricPreference(rawValue: menuBarMetricRaw)
+            let menuBarMetricRaw = userDefaults.string(forKey: "menuBarMetricPreference"),
+            let legacyPreference = MenuBarMetricPreference(rawValue: menuBarMetricRaw)
         {
             resolvedPreferences = Dictionary(
-                uniqueKeysWithValues: UsageProvider.allCases.map { ($0.rawValue, legacyPreference.rawValue) })
+                uniqueKeysWithValues: UsageProvider.allCases.map {
+                    ($0.rawValue, legacyPreference.rawValue)
+                })
         }
-        let costUsageEnabled = userDefaults.object(forKey: "tokenCostUsageEnabled") as? Bool ?? false
+        let costUsageEnabled =
+            userDefaults.object(forKey: "tokenCostUsageEnabled") as? Bool ?? false
         let hidePersonalInfo = userDefaults.object(forKey: "hidePersonalInfo") as? Bool ?? false
         let randomBlinkEnabled = userDefaults.object(forKey: "randomBlinkEnabled") as? Bool ?? false
-        let menuBarShowsHighestUsage = userDefaults.object(forKey: "menuBarShowsHighestUsage") as? Bool ?? false
-        let claudeOAuthKeychainPromptModeRaw = userDefaults.string(forKey: "claudeOAuthKeychainPromptMode")
-        let claudeOAuthKeychainReadStrategyRaw = userDefaults.string(forKey: "claudeOAuthKeychainReadStrategy")
-        let claudeWebExtrasEnabledRaw = userDefaults.object(forKey: "claudeWebExtrasEnabled") as? Bool ?? false
-        let creditsExtrasDefault = userDefaults.object(forKey: "showOptionalCreditsAndExtraUsage") as? Bool
+        let menuBarShowsHighestUsage =
+            userDefaults.object(forKey: "menuBarShowsHighestUsage") as? Bool ?? false
+        let claudeOAuthKeychainPromptModeRaw = userDefaults.string(
+            forKey: "claudeOAuthKeychainPromptMode")
+        let claudeOAuthKeychainReadStrategyRaw = userDefaults.string(
+            forKey: "claudeOAuthKeychainReadStrategy")
+        let claudeWebExtrasEnabledRaw =
+            userDefaults.object(forKey: "claudeWebExtrasEnabled") as? Bool ?? false
+        let creditsExtrasDefault =
+            userDefaults.object(forKey: "showOptionalCreditsAndExtraUsage") as? Bool
         let showOptionalCreditsAndExtraUsage = creditsExtrasDefault ?? true
-        if creditsExtrasDefault == nil { userDefaults.set(true, forKey: "showOptionalCreditsAndExtraUsage") }
+        if creditsExtrasDefault == nil {
+            userDefaults.set(true, forKey: "showOptionalCreditsAndExtraUsage")
+        }
         let openAIWebAccessDefault = userDefaults.object(forKey: "openAIWebAccessEnabled") as? Bool
         let openAIWebAccessEnabled = openAIWebAccessDefault ?? true
-        if openAIWebAccessDefault == nil { userDefaults.set(true, forKey: "openAIWebAccessEnabled") }
+        if openAIWebAccessDefault == nil {
+            userDefaults.set(true, forKey: "openAIWebAccessEnabled")
+        }
         let jetbrainsIDEBasePath = userDefaults.string(forKey: "jetbrainsIDEBasePath") ?? ""
         let mergeIcons = userDefaults.object(forKey: "mergeIcons") as? Bool ?? true
         let switcherShowsIcons = userDefaults.object(forKey: "switcherShowsIcons") as? Bool ?? true
+        let mergedMenuLastSelectedWasOverview =
+            userDefaults.object(
+                forKey: "mergedMenuLastSelectedWasOverview") as? Bool ?? false
+        let mergedOverviewSelectedProvidersRaw =
+            userDefaults.array(
+                forKey: "mergedOverviewSelectedProviders") as? [String] ?? []
         let selectedMenuProviderRaw = userDefaults.string(forKey: "selectedMenuProvider")
-        let secondarySelectedMenuProviderRaw = userDefaults.string(forKey: "secondarySelectedMenuProvider")
-        let providerDetectionCompleted = userDefaults.object(forKey: "providerDetectionCompleted") as? Bool ?? false
+        let secondarySelectedMenuProviderRaw = userDefaults.string(
+            forKey: "secondarySelectedMenuProvider")
+        let providerDetectionCompleted =
+            userDefaults.object(forKey: "providerDetectionCompleted") as? Bool ?? false
 
         return SettingsDefaultsState(
             refreshFrequency: refreshFrequency,
@@ -248,6 +283,8 @@ extension SettingsStore {
             jetbrainsIDEBasePath: jetbrainsIDEBasePath,
             mergeIcons: mergeIcons,
             switcherShowsIcons: switcherShowsIcons,
+            mergedMenuLastSelectedWasOverview: mergedMenuLastSelectedWasOverview,
+            mergedOverviewSelectedProvidersRaw: mergedOverviewSelectedProvidersRaw,
             selectedMenuProviderRaw: selectedMenuProviderRaw,
             secondarySelectedMenuProviderRaw: secondarySelectedMenuProviderRaw,
             providerDetectionCompleted: providerDetectionCompleted)
@@ -292,13 +329,15 @@ extension SettingsStore {
 
     func isProviderEnabledCached(
         provider: UsageProvider,
-        metadataByProvider: [UsageProvider: ProviderMetadata]) -> Bool
-    {
+        metadataByProvider: [UsageProvider: ProviderMetadata]
+    ) -> Bool {
         let defaultEnabled = metadataByProvider[provider]?.defaultEnabled ?? false
         return self.providerEnablement[provider] ?? defaultEnabled
     }
 
-    func enabledProvidersOrdered(metadataByProvider: [UsageProvider: ProviderMetadata]) -> [UsageProvider] {
+    func enabledProvidersOrdered(metadataByProvider: [UsageProvider: ProviderMetadata])
+        -> [UsageProvider]
+    {
         _ = metadataByProvider
         return self.orderedProviders().filter { self.providerEnablement[$0] ?? false }
     }
