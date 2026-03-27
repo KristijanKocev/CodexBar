@@ -22,7 +22,6 @@ struct OpenAIWebAccountSwitchTests {
         store.handleOpenAIWebTargetEmailChangeIfNeeded(targetEmail: "a@example.com")
         store.openAIDashboard = OpenAIDashboardSnapshot(
             signedInEmail: "a@example.com",
-            codeReviewRemainingPercent: 100,
             creditEvents: [],
             dailyBreakdown: [],
             usageBreakdown: [],
@@ -51,7 +50,6 @@ struct OpenAIWebAccountSwitchTests {
         store.handleOpenAIWebTargetEmailChangeIfNeeded(targetEmail: "a@example.com")
         let dash = OpenAIDashboardSnapshot(
             signedInEmail: "a@example.com",
-            codeReviewRemainingPercent: 100,
             creditEvents: [],
             dailyBreakdown: [],
             usageBreakdown: [],

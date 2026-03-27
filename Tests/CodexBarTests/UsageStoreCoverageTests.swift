@@ -59,7 +59,6 @@ struct UsageStoreCoverageTests {
         let store = Self.makeUsageStore(settings: settings)
         store.openAIDashboard = OpenAIDashboardSnapshot(
             signedInEmail: "user@example.com",
-            codeReviewRemainingPercent: nil,
             creditEvents: [],
             dailyBreakdown: [],
             usageBreakdown: [],

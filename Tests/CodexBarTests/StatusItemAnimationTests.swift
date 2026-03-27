@@ -398,6 +398,22 @@ struct StatusItemAnimationTests {
     }
 
     @Test
+    func menuBarDisplayTextUsesCursorRequestCountWhenAvailable() {
+        let percentWindow = RateWindow(usedPercent: 43, windowMinutes: nil, resetsAt: nil, resetDescription: nil)
+        let cursorRequests = CursorRequestUsage(used: 250, limit: 500)
+
+        let display = MenuBarDisplayText.displayText(
+            mode: .percent,
+            provider: .cursor,
+            percentWindow: percentWindow,
+            paceWindow: nil,
+            showUsed: false,
+            cursorRequests: cursorRequests)
+
+        #expect(display == "250/500")
+    }
+
+    @Test
     func menuBarDisplayTextHidesWhenPaceUnavailable() {
         let now = Date(timeIntervalSince1970: 0)
         let percentWindow = RateWindow(usedPercent: 40, windowMinutes: nil, resetsAt: nil, resetDescription: nil)

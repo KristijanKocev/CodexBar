@@ -173,7 +173,6 @@ extension CodexBarCLI {
         if cache.snapshot.dailyBreakdown.isEmpty, !cache.snapshot.creditEvents.isEmpty {
             return OpenAIDashboardSnapshot(
                 signedInEmail: cache.snapshot.signedInEmail,
-                codeReviewRemainingPercent: cache.snapshot.codeReviewRemainingPercent,
                 creditEvents: cache.snapshot.creditEvents,
                 dailyBreakdown: OpenAIDashboardSnapshot.makeDailyBreakdown(
                     from: cache.snapshot.creditEvents,
@@ -204,10 +203,6 @@ extension CodexBarCLI {
         var lines: [String] = []
         if let email = dash.signedInEmail, !email.isEmpty {
             lines.append("Web session: \(email)")
-        }
-        if let remaining = dash.codeReviewRemainingPercent {
-            let percent = Int(remaining.rounded())
-            lines.append("Code review: \(percent)% remaining")
         }
         if let first = dash.creditEvents.first {
             let day = first.date.formatted(date: .abbreviated, time: .omitted)

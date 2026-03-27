@@ -97,10 +97,8 @@ public struct OpenAIDashboardFetcher {
         var lastHTML: String?
         var lastHref: String?
         var lastFlags: (loginRequired: Bool, workspacePicker: Bool, cloudflare: Bool)?
-        var codeReviewFirstSeenAt: Date?
         var anyDashboardSignalAt: Date?
         var creditsHeaderVisibleAt: Date?
-        var lastUsageBreakdownDebug: String?
         var lastCreditsPurchaseURL: String?
 
         while Date() < deadline {
@@ -148,7 +146,6 @@ public struct OpenAIDashboardFetcher {
             }
 
             let bodyText = scrape.bodyText ?? ""
-            let codeReview = OpenAIDashboardParser.parseCodeReviewRemainingPercent(bodyText: bodyText)
             let events = OpenAIDashboardParser.parseCreditEvents(rows: scrape.rows)
             let breakdown = OpenAIDashboardSnapshot.makeDailyBreakdown(from: events, maxDays: 30)
             let usageBreakdown = scrape.usageBreakdown
@@ -157,26 +154,18 @@ public struct OpenAIDashboardFetcher {
             let accountPlan = scrape.bodyHTML.flatMap(OpenAIDashboardParser.parsePlanFromHTML)
             let hasUsageLimits = rateLimits.primary != nil || rateLimits.secondary != nil
 
-            if codeReview != nil, codeReviewFirstSeenAt == nil { codeReviewFirstSeenAt = Date() }
             if anyDashboardSignalAt == nil,
-               codeReview != nil || !usageBreakdown.isEmpty || scrape.creditsHeaderPresent ||
+               !usageBreakdown.isEmpty || scrape.creditsHeaderPresent ||
                hasUsageLimits || creditsRemaining != nil
             {
                 anyDashboardSignalAt = Date()
-            }
-            if codeReview != nil, usageBreakdown.isEmpty,
-               let debug = scrape.usageBreakdownDebug, !debug.isEmpty,
-               debug != lastUsageBreakdownDebug
-            {
-                lastUsageBreakdownDebug = debug
-                log("usage breakdown debug: \(debug)")
             }
             if let purchaseURL = scrape.creditsPurchaseURL, purchaseURL != lastCreditsPurchaseURL {
                 lastCreditsPurchaseURL = purchaseURL
                 log("credits purchase url: \(purchaseURL)")
             }
             if events.isEmpty,
-               codeReview != nil || !usageBreakdown.isEmpty || hasUsageLimits || creditsRemaining != nil
+               !usageBreakdown.isEmpty || hasUsageLimits || creditsRemaining != nil
             {
                 log(
                     "credits header present=\(scrape.creditsHeaderPresent) " +
@@ -206,21 +195,11 @@ public struct OpenAIDashboardFetcher {
                 }
             }
 
-            if codeReview != nil || !events.isEmpty || !usageBreakdown
+            if !events.isEmpty || !usageBreakdown
                 .isEmpty || hasUsageLimits || creditsRemaining != nil
             {
-                // The usage breakdown chart is hydrated asynchronously. When code review is already present,
-                // give it a moment to populate so the menu can show it.
-                if codeReview != nil, usageBreakdown.isEmpty {
-                    let elapsed = Date().timeIntervalSince(codeReviewFirstSeenAt ?? Date())
-                    if elapsed < 6 {
-                        try? await Task.sleep(for: .milliseconds(400))
-                        continue
-                    }
-                }
                 return OpenAIDashboardSnapshot(
                     signedInEmail: scrape.signedInEmail,
-                    codeReviewRemainingPercent: codeReview,
                     creditEvents: events,
                     dailyBreakdown: breakdown,
                     usageBreakdown: usageBreakdown,

@@ -56,7 +56,7 @@ See `docs/configuration.md` for the schema.
     - `oauth`: Claude OAuth only (debug); no fallback. Not supported for Codex.
     - `api`: API key flow when the provider supports it (z.ai, Gemini, Copilot, Kimi K2, MiniMax, Synthetic).
     - Output `source` reflects the strategy actually used (`openai-web`, `web`, `oauth`, `api`, `local`, or provider CLI label).
-    - Codex web: OpenAI web dashboard (usage limits, credits remaining, code review remaining, usage breakdown).
+    - Codex web: OpenAI web dashboard (usage limits, credits remaining, usage breakdown).
         - `--web-timeout <seconds>` (default: 60)
         - `--web-debug-dump-html` (writes HTML snapshots to `/tmp` when data is missing)
     - Claude web: claude.ai API (session + weekly usage, plus account metadata when available).
@@ -153,7 +153,6 @@ Plan: Pro
   "antigravityPlanInfo": null,
   "openaiDashboard": {
     "signedInEmail": "user@example.com",
-    "codeReviewRemainingPercent": 100,
     "creditEvents": [
       { "id": "00000000-0000-0000-0000-000000000000", "date": "2025-12-04T00:00:00Z", "service": "CLI", "creditsUsed": 123.45 }
     ],

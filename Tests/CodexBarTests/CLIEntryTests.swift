@@ -53,7 +53,6 @@ struct CLIEntryTests {
             creditsUsed: 10)
         let snapshot = OpenAIDashboardSnapshot(
             signedInEmail: "user@example.com",
-            codeReviewRemainingPercent: 45,
             creditEvents: [event],
             dailyBreakdown: [],
             usageBreakdown: [],
@@ -63,7 +62,6 @@ struct CLIEntryTests {
         let text = CodexBarCLI.renderOpenAIWebDashboardText(snapshot)
 
         #expect(text.contains("Web session: user@example.com"))
-        #expect(text.contains("Code review: 45% remaining"))
         #expect(text.contains("Web history: 1 events"))
     }
 

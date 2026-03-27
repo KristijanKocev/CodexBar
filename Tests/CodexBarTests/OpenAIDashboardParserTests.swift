@@ -22,18 +22,6 @@ struct OpenAIDashboardParserTests {
     }
 
     @Test
-    func parsesCodeReviewRemainingPercent_inline() {
-        let body = "Balance\nCode review 42% remaining\nCredits remaining 291"
-        #expect(OpenAIDashboardParser.parseCodeReviewRemainingPercent(bodyText: body) == 42)
-    }
-
-    @Test
-    func parsesCodeReviewRemainingPercent_multiline() {
-        let body = "Balance\nCode review\n100% remaining\nWeekly usage limit\n0% remaining"
-        #expect(OpenAIDashboardParser.parseCodeReviewRemainingPercent(bodyText: body) == 100)
-    }
-
-    @Test
     func parsesCreditsRemaining() {
         let body = "Balance\nCredits remaining 1,234.56\nUsage"
         let value = OpenAIDashboardParser.parseCreditsRemaining(bodyText: body)
@@ -120,7 +108,6 @@ struct OpenAIDashboardParserTests {
         let json = """
         {
           "signedInEmail": "user@example.com",
-          "codeReviewRemainingPercent": 42,
           "creditEvents": [],
           "dailyBreakdown": [],
           "updatedAt": "2025-12-18T00:00:00Z"

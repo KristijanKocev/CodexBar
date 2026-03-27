@@ -295,12 +295,6 @@ private struct SwitcherSmallUsageView: View {
                 title: ProviderDefaults.metadata[self.entry.provider]?.weeklyLabel ?? "Weekly",
                 percentLeft: self.entry.secondary?.remainingPercent,
                 color: WidgetColors.color(for: self.entry.provider))
-            if let codeReview = entry.codeReviewRemainingPercent {
-                UsageBarRow(
-                    title: "Code review",
-                    percentLeft: codeReview,
-                    color: WidgetColors.color(for: self.entry.provider))
-            }
         }
     }
 }
@@ -343,12 +337,6 @@ private struct SwitcherLargeUsageView: View {
                 title: ProviderDefaults.metadata[self.entry.provider]?.weeklyLabel ?? "Weekly",
                 percentLeft: self.entry.secondary?.remainingPercent,
                 color: WidgetColors.color(for: self.entry.provider))
-            if let codeReview = entry.codeReviewRemainingPercent {
-                UsageBarRow(
-                    title: "Code review",
-                    percentLeft: codeReview,
-                    color: WidgetColors.color(for: self.entry.provider))
-            }
             if let credits = entry.creditsRemaining {
                 ValueLine(title: "Credits", value: WidgetFormat.credits(credits))
             }
@@ -384,12 +372,6 @@ private struct SmallUsageView: View {
                 title: ProviderDefaults.metadata[self.entry.provider]?.weeklyLabel ?? "Weekly",
                 percentLeft: self.entry.secondary?.remainingPercent,
                 color: WidgetColors.color(for: self.entry.provider))
-            if let codeReview = entry.codeReviewRemainingPercent {
-                UsageBarRow(
-                    title: "Code review",
-                    percentLeft: codeReview,
-                    color: WidgetColors.color(for: self.entry.provider))
-            }
         }
         .padding(12)
     }
@@ -436,12 +418,6 @@ private struct LargeUsageView: View {
                 title: ProviderDefaults.metadata[self.entry.provider]?.weeklyLabel ?? "Weekly",
                 percentLeft: self.entry.secondary?.remainingPercent,
                 color: WidgetColors.color(for: self.entry.provider))
-            if let codeReview = entry.codeReviewRemainingPercent {
-                UsageBarRow(
-                    title: "Code review",
-                    percentLeft: codeReview,
-                    color: WidgetColors.color(for: self.entry.provider))
-            }
             if let credits = entry.creditsRemaining {
                 ValueLine(title: "Credits", value: WidgetFormat.credits(credits))
             }

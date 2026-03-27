@@ -383,6 +383,74 @@ struct CursorStatusProbeTests {
     }
 
     @Test
+    func parseUsageSummarySupportsAlternativeModelKeys() throws {
+        let summary = CursorUsageSummary(
+            billingCycleStart: nil,
+            billingCycleEnd: nil,
+            membershipType: nil,
+            limitType: nil,
+            isUnlimited: nil,
+            autoModelSelectedDisplayMessage: nil,
+            namedModelSelectedDisplayMessage: nil,
+            individualUsage: nil,
+            teamUsage: nil)
+        let requestUsageJSON = """
+        {
+            "gpt-4.1": {
+                "numRequestsTotal": 250,
+                "maxRequestUsage": 500
+            },
+            "startOfMonth": "2026-01-01T00:00:00.000Z"
+        }
+        """
+        let requestUsageData = try #require(requestUsageJSON.data(using: .utf8))
+        let requestUsage = try JSONDecoder().decode(CursorUsageResponse.self, from: requestUsageData)
+
+        let snapshot = CursorStatusProbe(browserDetection: BrowserDetection(cacheTTL: 0)).parseUsageSummary(
+            summary,
+            userInfo: nil,
+            rawJSON: nil,
+            requestUsage: requestUsage)
+
+        #expect(snapshot.requestsUsed == 250)
+        #expect(snapshot.requestsLimit == 500)
+    }
+
+    @Test
+    func parseUsageSummarySupportsStringRequestUsageValues() throws {
+        let summary = CursorUsageSummary(
+            billingCycleStart: nil,
+            billingCycleEnd: nil,
+            membershipType: nil,
+            limitType: nil,
+            isUnlimited: nil,
+            autoModelSelectedDisplayMessage: nil,
+            namedModelSelectedDisplayMessage: nil,
+            individualUsage: nil,
+            teamUsage: nil)
+        let requestUsageJSON = """
+        {
+            "gpt4": {
+                "numRequests": "120",
+                "numRequestsTotal": "240",
+                "maxRequestUsage": "500"
+            }
+        }
+        """
+        let requestUsageData = try #require(requestUsageJSON.data(using: .utf8))
+        let requestUsage = try JSONDecoder().decode(CursorUsageResponse.self, from: requestUsageData)
+
+        let snapshot = CursorStatusProbe(browserDetection: BrowserDetection(cacheTTL: 0)).parseUsageSummary(
+            summary,
+            userInfo: nil,
+            rawJSON: nil,
+            requestUsage: requestUsage)
+
+        #expect(snapshot.requestsUsed == 240)
+        #expect(snapshot.requestsLimit == 500)
+    }
+
+    @Test
     func detectsNonLegacyPlan() {
         let snapshot = CursorStatusSnapshot(
             planPercentUsed: 50.0,

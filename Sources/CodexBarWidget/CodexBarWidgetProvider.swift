@@ -266,7 +266,6 @@ enum WidgetPreviewData {
             secondary: secondary,
             tertiary: nil,
             creditsRemaining: 1243.4,
-            codeReviewRemainingPercent: 78,
             tokenUsage: WidgetSnapshot.TokenUsageSummary(
                 sessionCostUSD: 12.4,
                 sessionTokens: 420_000,

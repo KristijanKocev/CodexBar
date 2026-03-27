@@ -2,7 +2,6 @@ import Foundation
 
 public struct OpenAIDashboardSnapshot: Codable, Equatable, Sendable {
     public let signedInEmail: String?
-    public let codeReviewRemainingPercent: Double?
     public let creditEvents: [CreditEvent]
     public let dailyBreakdown: [OpenAIDashboardDailyBreakdown]
     /// Usage breakdown time series from the Codex dashboard chart ("Usage breakdown", 30 days).
@@ -18,7 +17,6 @@ public struct OpenAIDashboardSnapshot: Codable, Equatable, Sendable {
 
     public init(
         signedInEmail: String?,
-        codeReviewRemainingPercent: Double?,
         creditEvents: [CreditEvent],
         dailyBreakdown: [OpenAIDashboardDailyBreakdown],
         usageBreakdown: [OpenAIDashboardDailyBreakdown],
@@ -30,7 +28,6 @@ public struct OpenAIDashboardSnapshot: Codable, Equatable, Sendable {
         updatedAt: Date)
     {
         self.signedInEmail = signedInEmail
-        self.codeReviewRemainingPercent = codeReviewRemainingPercent
         self.creditEvents = creditEvents
         self.dailyBreakdown = dailyBreakdown
         self.usageBreakdown = usageBreakdown
@@ -44,7 +41,6 @@ public struct OpenAIDashboardSnapshot: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case signedInEmail
-        case codeReviewRemainingPercent
         case creditEvents
         case dailyBreakdown
         case usageBreakdown
@@ -59,9 +55,6 @@ public struct OpenAIDashboardSnapshot: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.signedInEmail = try container.decodeIfPresent(String.self, forKey: .signedInEmail)
-        self.codeReviewRemainingPercent = try container.decodeIfPresent(
-            Double.self,
-            forKey: .codeReviewRemainingPercent)
         self.creditEvents = try container.decodeIfPresent([CreditEvent].self, forKey: .creditEvents) ?? []
         self.dailyBreakdown = try container.decodeIfPresent(
             [OpenAIDashboardDailyBreakdown].self,

@@ -136,10 +136,94 @@ public struct CursorTeamUsage: Codable, Sendable {
 public struct CursorUsageResponse: Codable, Sendable {
     public let gpt4: CursorModelUsage?
     public let startOfMonth: String?
+    public let modelUsageByName: [String: CursorModelUsage]
 
-    enum CodingKeys: String, CodingKey {
-        case gpt4 = "gpt-4"
-        case startOfMonth
+    public init(
+        gpt4: CursorModelUsage?,
+        startOfMonth: String?,
+        modelUsageByName: [String: CursorModelUsage] = [:])
+    {
+        var mergedModels = modelUsageByName
+        if let gpt4 {
+            mergedModels["gpt-4"] = gpt4
+        }
+        self.gpt4 = gpt4
+        self.startOfMonth = startOfMonth
+        self.modelUsageByName = mergedModels
+    }
+
+    public var preferredRequestUsage: CursorModelUsage? {
+        if let gpt4, gpt4.hasRequestQuota {
+            return gpt4
+        }
+
+        let preferredModelKeys = ["gpt-4", "gpt4", "gpt-4.1", "gpt-4o"]
+        for key in preferredModelKeys {
+            if let usage = self.modelUsageByName[key], usage.hasRequestQuota {
+                return usage
+            }
+        }
+
+        return self.modelUsageByName.values
+            .filter(\.hasRequestQuota)
+            .max { lhs, rhs in
+                let lhsLimit = lhs.maxRequestUsage ?? -1
+                let rhsLimit = rhs.maxRequestUsage ?? -1
+                if lhsLimit != rhsLimit { return lhsLimit < rhsLimit }
+                let lhsUsed = lhs.numRequestsTotal ?? lhs.numRequests ?? -1
+                let rhsUsed = rhs.numRequestsTotal ?? rhs.numRequests ?? -1
+                return lhsUsed < rhsUsed
+            }
+    }
+
+    private struct DynamicCodingKeys: CodingKey {
+        let stringValue: String
+        let intValue: Int?
+
+        init?(stringValue: String) {
+            self.stringValue = stringValue
+            self.intValue = nil
+        }
+
+        init?(intValue: Int) {
+            self.stringValue = String(intValue)
+            self.intValue = intValue
+        }
+
+        init(_ stringValue: String) {
+            self.stringValue = stringValue
+            self.intValue = nil
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: DynamicCodingKeys.self)
+        self.startOfMonth = try container.decodeIfPresent(String.self, forKey: DynamicCodingKeys("startOfMonth"))
+
+        var modelUsageByName: [String: CursorModelUsage] = [:]
+        for key in container.allKeys where key.stringValue != "startOfMonth" {
+            if let usage = try container.decodeIfPresent(CursorModelUsage.self, forKey: key) {
+                modelUsageByName[key.stringValue] = usage
+            }
+        }
+
+        self.modelUsageByName = modelUsageByName
+        self.gpt4 = modelUsageByName["gpt-4"] ?? modelUsageByName["gpt4"]
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: DynamicCodingKeys.self)
+        try container.encodeIfPresent(self.startOfMonth, forKey: DynamicCodingKeys("startOfMonth"))
+
+        var encodedKeys: Set<String> = []
+        for (modelName, usage) in self.modelUsageByName {
+            try container.encode(usage, forKey: DynamicCodingKeys(modelName))
+            encodedKeys.insert(modelName)
+        }
+
+        if let gpt4, !encodedKeys.contains("gpt-4"), !encodedKeys.contains("gpt4") {
+            try container.encode(gpt4, forKey: DynamicCodingKeys("gpt-4"))
+        }
     }
 }
 
@@ -149,6 +233,60 @@ public struct CursorModelUsage: Codable, Sendable {
     public let numTokens: Int?
     public let maxRequestUsage: Int?
     public let maxTokenUsage: Int?
+
+    public init(
+        numRequests: Int?,
+        numRequestsTotal: Int?,
+        numTokens: Int?,
+        maxRequestUsage: Int?,
+        maxTokenUsage: Int?)
+    {
+        self.numRequests = numRequests
+        self.numRequestsTotal = numRequestsTotal
+        self.numTokens = numTokens
+        self.maxRequestUsage = maxRequestUsage
+        self.maxTokenUsage = maxTokenUsage
+    }
+
+    public var hasRequestQuota: Bool {
+        (self.maxRequestUsage ?? 0) > 0 || self.numRequestsTotal != nil || self.numRequests != nil
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case numRequests
+        case numRequestsTotal
+        case numTokens
+        case maxRequestUsage
+        case maxTokenUsage
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.numRequests = Self.decodeFlexibleInt(container, key: .numRequests)
+        self.numRequestsTotal = Self.decodeFlexibleInt(container, key: .numRequestsTotal)
+        self.numTokens = Self.decodeFlexibleInt(container, key: .numTokens)
+        self.maxRequestUsage = Self.decodeFlexibleInt(container, key: .maxRequestUsage)
+        self.maxTokenUsage = Self.decodeFlexibleInt(container, key: .maxTokenUsage)
+    }
+
+    private static func decodeFlexibleInt(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        key: CodingKeys) -> Int?
+    {
+        if let intValue = try? container.decode(Int.self, forKey: key) {
+            return intValue
+        }
+        if let stringValue = try? container.decode(String.self, forKey: key) {
+            let trimmed = stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let intValue = Int(trimmed) {
+                return intValue
+            }
+        }
+        if let doubleValue = try? container.decode(Double.self, forKey: key) {
+            return Int(doubleValue)
+        }
+        return nil
+    }
 }
 
 public struct CursorUserInfo: Codable, Sendable {
@@ -709,9 +847,10 @@ public struct CursorStatusProbe: Sendable {
         let teamOnDemandUsed: Double? = summary.teamUsage?.onDemand?.used.map { Double($0) / 100.0 }
         let teamOnDemandLimit: Double? = summary.teamUsage?.onDemand?.limit.map { Double($0) / 100.0 }
 
-        // Legacy request-based plan: maxRequestUsage being non-nil indicates a request-based plan
-        let requestsUsed: Int? = requestUsage?.gpt4?.numRequestsTotal ?? requestUsage?.gpt4?.numRequests
-        let requestsLimit: Int? = requestUsage?.gpt4?.maxRequestUsage
+        // Legacy request-based plan: use whichever model reports a request quota.
+        let requestModelUsage = requestUsage?.preferredRequestUsage
+        let requestsUsed: Int? = requestModelUsage?.numRequestsTotal ?? requestModelUsage?.numRequests
+        let requestsLimit: Int? = requestModelUsage?.maxRequestUsage
 
         return CursorStatusSnapshot(
             planPercentUsed: planPercentUsed,

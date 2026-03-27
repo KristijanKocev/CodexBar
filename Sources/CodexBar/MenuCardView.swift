@@ -878,20 +878,6 @@ extension UsageMenuCardView.Model {
                 paceOnTop: true))
         }
 
-        if input.provider == .codex, let remaining = input.dashboard?.codeReviewRemainingPercent {
-            let percent = input.usageBarsShowUsed ? (100 - remaining) : remaining
-            metrics.append(Metric(
-                id: "code-review",
-                title: "Code review",
-                percent: Self.clamped(percent),
-                percentStyle: percentStyle,
-                resetText: nil,
-                detailText: nil,
-                detailLeftText: nil,
-                detailRightText: nil,
-                pacePercent: nil,
-                paceOnTop: true))
-        }
         return metrics
     }
 

@@ -38,7 +38,6 @@ extension UsageStore {
 
         let tokenUsage = Self.widgetTokenUsageSummary(from: tokenSnapshot)
         let creditsRemaining = provider == .codex ? self.credits?.remaining : nil
-        let codeReviewRemaining = provider == .codex ? self.openAIDashboard?.codeReviewRemainingPercent : nil
 
         return WidgetSnapshot.ProviderEntry(
             provider: provider,
@@ -47,7 +46,6 @@ extension UsageStore {
             secondary: snapshot.secondary,
             tertiary: snapshot.tertiary,
             creditsRemaining: creditsRemaining,
-            codeReviewRemainingPercent: codeReviewRemaining,
             tokenUsage: tokenUsage,
             dailyUsage: dailyUsage)
     }

@@ -93,7 +93,6 @@ struct MenuCardModelTests {
 
         let dashboard = OpenAIDashboardSnapshot(
             signedInEmail: "codex@example.com",
-            codeReviewRemainingPercent: 73,
             creditEvents: [],
             dailyBreakdown: [],
             usageBreakdown: [],
@@ -123,54 +122,6 @@ struct MenuCardModelTests {
         #expect(model.metrics.first?.title == "Session")
         #expect(model.metrics.first?.percent == 22)
         #expect(model.metrics.first?.percentLabel.contains("used") == true)
-        #expect(model.metrics.contains { $0.title == "Code review" && $0.percent == 27 })
-    }
-
-    @Test
-    func showsCodeReviewMetricWhenDashboardPresent() throws {
-        let now = Date()
-        let identity = ProviderIdentitySnapshot(
-            providerID: .codex,
-            accountEmail: "codex@example.com",
-            accountOrganization: nil,
-            loginMethod: nil)
-        let snapshot = UsageSnapshot(
-            primary: RateWindow(usedPercent: 0, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
-            secondary: nil,
-            tertiary: nil,
-            updatedAt: now,
-            identity: identity)
-        let metadata = try #require(ProviderDefaults.metadata[.codex])
-
-        let dashboard = OpenAIDashboardSnapshot(
-            signedInEmail: "codex@example.com",
-            codeReviewRemainingPercent: 73,
-            creditEvents: [],
-            dailyBreakdown: [],
-            usageBreakdown: [],
-            creditsPurchaseURL: nil,
-            updatedAt: now)
-        let model = UsageMenuCardView.Model.make(.init(
-            provider: .codex,
-            metadata: metadata,
-            snapshot: snapshot,
-            credits: nil,
-            creditsError: nil,
-            dashboard: dashboard,
-            dashboardError: nil,
-            tokenSnapshot: nil,
-            tokenError: nil,
-            account: AccountInfo(email: "codex@example.com", plan: nil),
-            isRefreshing: false,
-            lastError: nil,
-            usageBarsShowUsed: false,
-            resetTimeDisplayStyle: .countdown,
-            tokenCostUsageEnabled: false,
-            showOptionalCreditsAndExtraUsage: true,
-            hidePersonalInfo: false,
-            now: now))
-
-        #expect(model.metrics.contains { $0.title == "Code review" && $0.percent == 73 })
     }
 
     @Test
