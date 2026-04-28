@@ -13,6 +13,7 @@ struct WidgetSnapshotTests {
             secondary: RateWindow(usedPercent: 20, windowMinutes: nil, resetsAt: nil, resetDescription: nil),
             tertiary: nil,
             creditsRemaining: 123.4,
+            codeReviewRemainingPercent: 80,
             tokenUsage: WidgetSnapshot.TokenUsageSummary(
                 sessionCostUSD: 12.3,
                 sessionTokens: 1200,

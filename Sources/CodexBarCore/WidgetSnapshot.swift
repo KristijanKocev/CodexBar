@@ -8,6 +8,7 @@ public struct WidgetSnapshot: Codable, Sendable {
         public let secondary: RateWindow?
         public let tertiary: RateWindow?
         public let creditsRemaining: Double?
+        public let codeReviewRemainingPercent: Double?
         public let tokenUsage: TokenUsageSummary?
         public let dailyUsage: [DailyUsagePoint]
 
@@ -18,6 +19,7 @@ public struct WidgetSnapshot: Codable, Sendable {
             secondary: RateWindow?,
             tertiary: RateWindow?,
             creditsRemaining: Double?,
+            codeReviewRemainingPercent: Double?,
             tokenUsage: TokenUsageSummary?,
             dailyUsage: [DailyUsagePoint])
         {
@@ -27,6 +29,7 @@ public struct WidgetSnapshot: Codable, Sendable {
             self.secondary = secondary
             self.tertiary = tertiary
             self.creditsRemaining = creditsRemaining
+            self.codeReviewRemainingPercent = codeReviewRemainingPercent
             self.tokenUsage = tokenUsage
             self.dailyUsage = dailyUsage
         }
