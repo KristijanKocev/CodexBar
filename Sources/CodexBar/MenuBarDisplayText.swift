@@ -9,14 +9,13 @@ enum MenuBarDisplayText {
         return String(format: "%.0f%%", clamped)
     }
 
-    static func cursorRequestText(cursorRequests: CursorRequestUsage?, showUsed: Bool) -> String? {
+    static func cursorRequestText(cursorRequests: CursorRequestUsage?, showUsed _: Bool) -> String? {
         guard let requests = cursorRequests else { return nil }
         return "\(requests.used)/\(requests.limit)"
     }
 
-    static func paceText(provider: UsageProvider, window: RateWindow?, now: Date = .init()) -> String? {
-        guard let window else { return nil }
-        guard let pace = UsagePaceText.weeklyPace(provider: provider, window: window, now: now) else { return nil }
+    static func paceText(pace: UsagePace?) -> String? {
+        guard let pace else { return nil }
         let deltaValue = Int(abs(pace.deltaPercent).rounded())
         let sign = pace.deltaPercent >= 0 ? "+" : "-"
         return "\(sign)\(deltaValue)%"
@@ -24,31 +23,35 @@ enum MenuBarDisplayText {
 
     static func displayText(
         mode: MenuBarDisplayMode,
-        provider: UsageProvider,
+        provider: UsageProvider? = nil,
         percentWindow: RateWindow?,
-        paceWindow: RateWindow?,
+        pace: UsagePace? = nil,
         showUsed: Bool,
-        cursorRequests: CursorRequestUsage? = nil,
-        now: Date = .init()) -> String?
+        cursorRequests: CursorRequestUsage? = nil) -> String?
     {
         switch mode {
         case .percent:
-            if provider == .cursor, let requestText = self.cursorRequestText(cursorRequests: cursorRequests, showUsed: showUsed) {
+            if provider == .cursor,
+               let requestText = self.cursorRequestText(cursorRequests: cursorRequests, showUsed: showUsed)
+            {
                 return requestText
             }
             return self.percentText(window: percentWindow, showUsed: showUsed)
         case .pace:
-            return self.paceText(provider: provider, window: paceWindow, now: now)
+            return self.paceText(pace: pace)
         case .both:
-            let percentPart: String?
-            if provider == .cursor, let requestText = self.cursorRequestText(cursorRequests: cursorRequests, showUsed: showUsed) {
-                percentPart = requestText
-            } else {
-                percentPart = percentText(window: percentWindow, showUsed: showUsed)
-            }
+            let percentPart: String? = {
+                if provider == .cursor,
+                   let requestText = self.cursorRequestText(cursorRequests: cursorRequests, showUsed: showUsed)
+                {
+                    return requestText
+                }
+                return self.percentText(window: percentWindow, showUsed: showUsed)
+            }()
             guard let percent = percentPart else { return nil }
-            guard let pace = Self.paceText(provider: provider, window: paceWindow, now: now) else { return nil }
-            return "\(percent) · \(pace)"
+            // Fall back to percent-only when pace is unavailable (e.g. Copilot, legacy Cursor plans).
+            guard let paceText = Self.paceText(pace: pace) else { return percent }
+            return "\(percent) · \(paceText)"
         }
     }
 }

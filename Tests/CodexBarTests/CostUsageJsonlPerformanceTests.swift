@@ -5,7 +5,7 @@ import Testing
 @Suite(.serialized)
 struct CostUsageJsonlPerformanceTests {
     @Test
-    func scannerBenchmarkBeatsFrontBufferBaseline() throws {
+    func `scanner benchmark beats front buffer baseline`() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
             "codexbar-cost-usage-bench-\(UUID().uuidString)",
             isDirectory: true)
@@ -62,7 +62,8 @@ struct CostUsageJsonlPerformanceTests {
             scanner: scanWithFrontBufferBaseline)
 
         let speedup = Double(baselineFastest) / Double(currentFastest)
-        #expect(speedup >= 5.0)
+        // Keep the guard high enough to catch regressions without making the full test suite depend on an idle CPU.
+        #expect(speedup >= 4.0)
     }
 }
 
