@@ -41,7 +41,7 @@ read_when:
 swift build
 
 # Run tests
-swift test
+make test
 
 # Format code
 swiftformat Sources Tests
@@ -57,11 +57,9 @@ cd /Users/steipete/Projects/codexbar && open -n /Users/steipete/Projects/codexba
 
 ### Release
 ```bash
-# Sign and notarize (keep in foreground!)
-./Scripts/sign-and-notarize.sh
-
-# Create appcast
-./Scripts/make_appcast.sh <zip> <feed-url>
+# Edit .mac-release.env first: MAC_RELEASE_REPO, feed URL, download URL,
+# bundle id, and Sparkle public/signing key must point at your fork.
+./Scripts/release.sh
 
 # See full release process
 cat docs/RELEASING.md
@@ -130,13 +128,13 @@ git push origin feature/my-feature
 ### Testing Changes
 ```bash
 # Run all tests
-swift test
+make test
 
 # Run specific test
 swift test --filter AugmentTests
 
 # Build and test together
-./Scripts/compile_and_run.sh
+./Scripts/compile_and_run.sh --test
 ```
 
 ### Updating Documentation

@@ -603,12 +603,42 @@ struct ManagedCodexAccountServiceTests {
             identityReader: StubManagedCodexIdentityReader.emails([]),
             workspaceResolver: StubManagedCodexWorkspaceResolver())
 
-        await #expect(throws: ManagedCodexAccountServiceError.loginFailed) {
+        await #expect(throws: ManagedCodexAccountServiceError.self) {
             try await service.authenticateManagedAccount()
         }
 
         #expect(FileManager.default.fileExists(atPath: outsideHome.path))
         #expect(store.snapshot.accounts.isEmpty)
+    }
+
+    @Test
+    func `auth failure preserves codex login result output`() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let loginResult = CodexLoginRunner.Result(
+            outcome: .failed(status: 42),
+            output: "OAuth callback used the wrong browser profile")
+        let service = ManagedCodexAccountService(
+            store: InMemoryManagedCodexAccountStore(
+                accounts: ManagedCodexAccountSet(version: 1, accounts: [])),
+            homeFactory: TestManagedCodexHomeFactory(root: root),
+            loginRunner: StubManagedCodexLoginRunner(result: loginResult),
+            identityReader: StubManagedCodexIdentityReader.emails([]),
+            workspaceResolver: StubManagedCodexWorkspaceResolver())
+
+        do {
+            _ = try await service.authenticateManagedAccount()
+            Issue.record("Expected managed Codex login failure")
+        } catch let error as ManagedCodexAccountServiceError {
+            guard case let .loginFailed(capturedResult) = error else {
+                Issue.record("Expected loginFailed, got \(error)")
+                return
+            }
+            #expect(capturedResult == loginResult)
+            #expect(error.userFacingMessage.contains("codex --version"))
+            #expect(error.userFacingMessage.contains("OAuth callback used the wrong browser profile"))
+        }
     }
 
     @Test
@@ -718,7 +748,7 @@ struct ManagedCodexAccountServiceTests {
     }
 
     @Test
-    func `remove fails closed for home outside managed root`() async throws {
+    func `remove drops account but leaves unsafe home untouched`() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let outsideRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
             UUID().uuidString,
@@ -746,11 +776,9 @@ struct ManagedCodexAccountServiceTests {
             identityReader: StubManagedCodexIdentityReader.emails([]),
             workspaceResolver: StubManagedCodexWorkspaceResolver())
 
-        await #expect(throws: ManagedCodexAccountServiceError.unsafeManagedHome(account.managedHomePath)) {
-            try await service.removeManagedAccount(id: account.id)
-        }
+        try await service.removeManagedAccount(id: account.id)
 
-        #expect(store.snapshot.accounts.count == 1)
+        #expect(store.snapshot.accounts.isEmpty)
         #expect(FileManager.default.fileExists(atPath: outsideRoot.path))
     }
 }

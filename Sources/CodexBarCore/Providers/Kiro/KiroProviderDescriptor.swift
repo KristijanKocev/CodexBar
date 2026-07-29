@@ -1,9 +1,8 @@
-import CodexBarMacroSupport
 import Foundation
 
-@ProviderDescriptorRegistration
-@ProviderDescriptorDefinition
 public enum KiroProviderDescriptor {
+    public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
+
     static func makeDescriptor() -> ProviderDescriptor {
         ProviderDescriptor(
             id: .kiro,
@@ -27,7 +26,12 @@ public enum KiroProviderDescriptor {
             branding: ProviderBranding(
                 iconStyle: .kiro,
                 iconResourceName: "ProviderIcon-kiro",
-                color: ProviderColor(red: 255 / 255, green: 153 / 255, blue: 0 / 255)),
+                color: ProviderColor(red: 255 / 255, green: 153 / 255, blue: 0 / 255),
+                confettiPalette: [
+                    ProviderColor(hex: 0x8F4AFF),
+                    ProviderColor(hex: 0xCAA9FF),
+                    ProviderColor(hex: 0x2B2B2B),
+                ]),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Kiro cost summary is not supported." }),

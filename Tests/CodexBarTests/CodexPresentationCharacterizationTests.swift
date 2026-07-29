@@ -96,7 +96,46 @@ struct CodexPresentationCharacterizationTests {
     }
 
     @Test
-    func `Codex menu humanizes prolite plan from snapshot identity`() {
+    func `Codex menu omits account row when hiding personal info`() {
+        let settings = self.makeSettingsStore(suite: "CodexPresentationCharacterizationTests-hide-account")
+        settings.statusChecksEnabled = false
+        settings.hidePersonalInfo = true
+
+        let fetcher = UsageFetcher(environment: [:])
+        let store = UsageStore(
+            fetcher: fetcher,
+            browserDetection: BrowserDetection(cacheTTL: 0),
+            settings: settings,
+            startupBehavior: .testing)
+        store._setSnapshotForTesting(
+            UsageSnapshot(
+                primary: RateWindow(usedPercent: 12, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
+                secondary: nil,
+                updatedAt: Date(),
+                identity: ProviderIdentitySnapshot(
+                    providerID: .codex,
+                    accountEmail: "codex@example.com",
+                    accountOrganization: nil,
+                    loginMethod: "free")),
+            provider: .codex)
+
+        let descriptor = MenuDescriptor.build(
+            provider: .codex,
+            store: store,
+            settings: settings,
+            account: fetcher.loadAccountInfo(),
+            updateReady: false,
+            includeContextualActions: false)
+
+        let lines = self.textLines(from: descriptor)
+        #expect(!lines.contains(where: { $0.hasPrefix("Account:") }))
+        #expect(!lines.contains(where: { $0.contains("codex@example.com") }))
+        #expect(!lines.contains(where: { $0.contains("Hidden") }))
+        #expect(lines.contains("Plan: Free"))
+    }
+
+    @Test
+    func `Codex menu maps prolite plan to multiplier display name`() {
         let settings = self.makeSettingsStore(suite: "CodexPresentationCharacterizationTests-prolite")
         settings.statusChecksEnabled = false
 
@@ -127,7 +166,8 @@ struct CodexPresentationCharacterizationTests {
             includeContextualActions: false)
 
         let lines = self.textLines(from: descriptor)
-        #expect(lines.contains("Plan: Pro Lite"))
+        #expect(lines.contains("Plan: Pro 5x"))
+        #expect(!lines.contains("Plan: Pro Lite"))
         #expect(!lines.contains("Plan: Prolite"))
     }
 

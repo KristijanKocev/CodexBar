@@ -35,10 +35,25 @@ protocol ManagedCodexWorkspaceSelecting: Sendable {
 }
 
 enum ManagedCodexAccountServiceError: Error, Equatable {
-    case loginFailed
+    case loginFailed(CodexLoginRunner.Result)
     case missingEmail
     case workspaceSelectionCancelled
     case unsafeManagedHome(String)
+}
+
+extension ManagedCodexAccountServiceError {
+    var userFacingMessage: String {
+        switch self {
+        case let .loginFailed(result):
+            CodexLoginAlertPresentation.managedLoginFailureMessage(for: result)
+        case .missingEmail:
+            L("managed_login_missing_email")
+        case .workspaceSelectionCancelled:
+            L("workspace_selection_cancelled")
+        case let .unsafeManagedHome(path):
+            String(format: L("unsafe_managed_home"), path)
+        }
+    }
 }
 
 struct ManagedCodexHomeFactory: ManagedCodexHomeProducing {
@@ -161,12 +176,12 @@ struct CodexWorkspaceAlertSelector: ManagedCodexWorkspaceSelecting {
         }
 
         let alert = NSAlert()
-        alert.messageText = "Choose Codex workspace"
-        alert.informativeText = "CodexBar found multiple workspaces for \(email). Choose the one to add."
+        alert.messageText = L("Choose Codex workspace")
+        alert.informativeText = String(format: L("multiple_workspaces_found"), email)
         alert.alertStyle = .informational
         alert.accessoryView = popup
-        alert.addButton(withTitle: "Add Workspace")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: L("Add Workspace"))
+        alert.addButton(withTitle: L("Cancel"))
 
         guard alert.runModal() == .alertFirstButtonReturn else {
             return nil
@@ -232,7 +247,7 @@ final class ManagedCodexAccountService {
 
         do {
             let result = await self.loginRunner.run(homePath: homeURL.path, timeout: timeout)
-            guard case .success = result.outcome else { throw ManagedCodexAccountServiceError.loginFailed }
+            guard case .success = result.outcome else { throw ManagedCodexAccountServiceError.loginFailed(result) }
 
             let identity = try self.identityReader.loadAccountIdentity(homePath: homeURL.path)
             guard let rawEmail = identity.email?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -276,6 +291,9 @@ final class ManagedCodexAccountService {
                 providerAccountID: persistedMetadata.providerAccountID,
                 workspaceLabel: persistedMetadata.workspaceLabel,
                 workspaceAccountID: persistedMetadata.workspaceAccountID,
+                authFingerprint: CodexAuthFingerprint.fingerprint(
+                    homePath: homeURL.path,
+                    fileManager: self.fileManager),
                 managedHomePath: homeURL.path,
                 createdAt: existing?.createdAt ?? now,
                 updatedAt: now,
@@ -310,14 +328,14 @@ final class ManagedCodexAccountService {
         guard let account = snapshot.account(id: id) else { return }
 
         let homeURL = URL(fileURLWithPath: account.managedHomePath, isDirectory: true)
-        try self.homeFactory.validateManagedHomeForDeletion(homeURL)
+        let canDeleteHome = (try? self.homeFactory.validateManagedHomeForDeletion(homeURL)) != nil
 
         let remaining = snapshot.accounts.filter { $0.id != id }
         try self.store.storeAccounts(ManagedCodexAccountSet(
             version: snapshot.version,
             accounts: remaining))
 
-        if self.fileManager.fileExists(atPath: homeURL.path) {
+        if canDeleteHome, self.fileManager.fileExists(atPath: homeURL.path) {
             try? self.fileManager.removeItem(at: homeURL)
         }
     }

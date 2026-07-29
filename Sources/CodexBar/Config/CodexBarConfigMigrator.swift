@@ -13,12 +13,13 @@ struct CodexBarConfigMigrator {
         let minimaxCookieStore: any MiniMaxCookieStoring
         let minimaxAPITokenStore: any MiniMaxAPITokenStoring
         let kimiTokenStore: any KimiTokenStoring
-        let kimiK2TokenStore: any KimiK2TokenStoring
         let augmentCookieStore: any CookieHeaderStoring
         let ampCookieStore: any CookieHeaderStoring
         let copilotTokenStore: any CopilotTokenStoring
         let tokenAccountStore: any ProviderTokenAccountStoring
     }
+
+    private static let legacyMigrationCompletedKey = "codexbar.legacySecretsMigrationCompleted"
 
     private struct MigrationState {
         var didUpdate = false
@@ -36,24 +37,43 @@ struct CodexBarConfigMigrator {
         var config = (existing ?? CodexBarConfig.makeDefault()).normalized()
         var state = MigrationState()
 
-        if existing == nil {
-            self.applyLegacyOrderAndToggles(userDefaults: userDefaults, config: &config, state: &state)
+        // applyLegacyCookieSources reads only UserDefaults — cheap, runs unconditionally so
+        // newly-added cookie-source keys are picked up on every launch.
+        self.applyLegacyCookieSources(userDefaults: userDefaults, config: &config, state: &state)
+
+        let migrationCompleted = userDefaults.bool(forKey: Self.legacyMigrationCompletedKey)
+        if !migrationCompleted {
+            // Run once: migrate Keychain/file secrets then clear them. Using a completion flag rather
+            // than `existing == nil` ensures a crash between config-save and clearLegacyStores can
+            // finish cleanup on the next launch without re-doing the (already-saved) data migration.
+            if existing == nil {
+                self.applyLegacyOrderAndToggles(userDefaults: userDefaults, config: &config, state: &state)
+            }
+            self.migrateLegacySecrets(userDefaults: userDefaults, stores: stores, config: &config, state: &state)
+            self.migrateLegacyAccounts(stores: stores, config: &config, state: &state)
         }
 
-        self.applyLegacyCookieSources(userDefaults: userDefaults, config: &config, state: &state)
-        self.migrateLegacySecrets(userDefaults: userDefaults, stores: stores, config: &config, state: &state)
-        self.migrateLegacyAccounts(stores: stores, config: &config, state: &state)
-
+        var didPersistUpdates = true
         if state.didUpdate {
             do {
                 try configStore.save(config)
             } catch {
+                didPersistUpdates = false
                 log.error("Failed to persist config: \(error)")
             }
         }
 
+        guard didPersistUpdates else {
+            return config.normalized()
+        }
+
         if state.sawLegacySecrets || state.sawLegacyAccounts {
-            self.clearLegacyStores(stores: stores, sawAccounts: state.sawLegacyAccounts, log: log)
+            let cleared = self.clearLegacyStores(stores: stores, sawAccounts: state.sawLegacyAccounts, log: log)
+            if cleared {
+                userDefaults.set(true, forKey: Self.legacyMigrationCompletedKey)
+            }
+        } else if !migrationCompleted {
+            userDefaults.set(true, forKey: Self.legacyMigrationCompletedKey)
         }
 
         return config.normalized()
@@ -86,7 +106,6 @@ struct CodexBarConfigMigrator {
                 (.zai, stores.zaiTokenStore.loadToken),
                 (.synthetic, stores.syntheticTokenStore.loadToken),
                 (.copilot, stores.copilotTokenStore.loadToken),
-                (.kimik2, stores.kimiK2TokenStore.loadToken),
             ],
             config: &config,
             state: &state)
@@ -274,18 +293,19 @@ struct CodexBarConfigMigrator {
         return false
     }
 
+    @discardableResult
     private static func clearLegacyStores(
         stores: LegacyStores,
         sawAccounts: Bool,
-        log: CodexBarLogger)
+        log: CodexBarLogger) -> Bool
     {
+        var success = true
         do {
             try stores.zaiTokenStore.storeToken(nil)
             try stores.syntheticTokenStore.storeToken(nil)
             try stores.copilotTokenStore.storeToken(nil)
             try stores.minimaxAPITokenStore.storeToken(nil)
             try stores.kimiTokenStore.storeToken(nil)
-            try stores.kimiK2TokenStore.storeToken(nil)
             try stores.codexCookieStore.storeCookieHeader(nil)
             try stores.claudeCookieStore.storeCookieHeader(nil)
             try stores.cursorCookieStore.storeCookieHeader(nil)
@@ -296,6 +316,7 @@ struct CodexBarConfigMigrator {
             try stores.ampCookieStore.storeCookieHeader(nil)
         } catch {
             log.error("Failed to clear legacy secrets: \(error)")
+            success = false
         }
 
         if sawAccounts {
@@ -304,6 +325,8 @@ struct CodexBarConfigMigrator {
                 try? FileManager.default.removeItem(at: legacyURL)
             }
         }
+
+        return success
     }
 
     private static func applyProviderOrder(_ raw: [String], config: CodexBarConfig) -> CodexBarConfig {

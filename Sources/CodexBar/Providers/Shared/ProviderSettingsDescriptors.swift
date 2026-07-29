@@ -25,6 +25,33 @@ struct ProviderSettingsContext {
     let setLastAppActiveRunAt: (String, Date?) -> Void
 
     let requestConfirmation: (ProviderSettingsConfirmation) -> Void
+    let runLoginFlow: () async -> Void
+
+    init(
+        provider: UsageProvider,
+        settings: SettingsStore,
+        store: UsageStore,
+        boolBinding: @escaping (ReferenceWritableKeyPath<SettingsStore, Bool>) -> Binding<Bool>,
+        stringBinding: @escaping (ReferenceWritableKeyPath<SettingsStore, String>) -> Binding<String>,
+        statusText: @escaping (String) -> String?,
+        setStatusText: @escaping (String, String?) -> Void,
+        lastAppActiveRunAt: @escaping (String) -> Date?,
+        setLastAppActiveRunAt: @escaping (String, Date?) -> Void,
+        requestConfirmation: @escaping (ProviderSettingsConfirmation) -> Void,
+        runLoginFlow: @escaping () async -> Void = {})
+    {
+        self.provider = provider
+        self.settings = settings
+        self.store = store
+        self.boolBinding = boolBinding
+        self.stringBinding = stringBinding
+        self.statusText = statusText
+        self.setStatusText = setStatusText
+        self.lastAppActiveRunAt = lastAppActiveRunAt
+        self.setLastAppActiveRunAt = setLastAppActiveRunAt
+        self.requestConfirmation = requestConfirmation
+        self.runLoginFlow = runLoginFlow
+    }
 }
 
 /// Shared confirmation alert descriptor.
@@ -55,6 +82,9 @@ struct ProviderSettingsToggleDescriptor: Identifiable {
     /// Optional runtime visibility gate.
     let isVisible: (() -> Bool)?
 
+    /// Optional runtime enabled gate.
+    let isEnabled: (() -> Bool)?
+
     /// Called whenever the toggle changes.
     let onChange: ((_ enabled: Bool) async -> Void)?
 
@@ -63,6 +93,32 @@ struct ProviderSettingsToggleDescriptor: Identifiable {
 
     /// Called when the view appears while the toggle is enabled.
     let onAppearWhenEnabled: (() async -> Void)?
+
+    init(
+        id: String,
+        title: String,
+        subtitle: String,
+        binding: Binding<Bool>,
+        statusText: (() -> String?)?,
+        actions: [ProviderSettingsActionDescriptor],
+        isVisible: (() -> Bool)?,
+        isEnabled: (() -> Bool)? = nil,
+        onChange: ((_ enabled: Bool) async -> Void)?,
+        onAppDidBecomeActive: (() async -> Void)?,
+        onAppearWhenEnabled: (() async -> Void)?)
+    {
+        self.id = id
+        self.title = title
+        self.subtitle = subtitle
+        self.binding = binding
+        self.statusText = statusText
+        self.actions = actions
+        self.isVisible = isVisible
+        self.isEnabled = isEnabled
+        self.onChange = onChange
+        self.onAppDidBecomeActive = onAppDidBecomeActive
+        self.onAppearWhenEnabled = onAppearWhenEnabled
+    }
 }
 
 /// Shared text field descriptor rendered in the Providers settings pane.
@@ -85,6 +141,16 @@ struct ProviderSettingsFieldDescriptor: Identifiable {
     let onActivate: (() -> Void)?
 }
 
+/// Shared action row descriptor rendered in the Providers settings pane.
+@MainActor
+struct ProviderSettingsActionsDescriptor: Identifiable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let actions: [ProviderSettingsActionDescriptor]
+    let isVisible: (() -> Bool)?
+}
+
 /// Shared token account descriptor rendered in the Providers settings pane.
 @MainActor
 struct ProviderSettingsTokenAccountsDescriptor: Identifiable {
@@ -97,18 +163,86 @@ struct ProviderSettingsTokenAccountsDescriptor: Identifiable {
     let accounts: () -> [ProviderTokenAccount]
     let activeIndex: () -> Int
     let setActiveIndex: (Int) -> Void
-    let addAccount: (_ label: String, _ token: String) -> Void
+    let showsOrganizationField: Bool
+    let showsTeamModeControls: Bool
+    let addAccount: (
+        _ label: String,
+        _ token: String,
+        _ usageScope: String?,
+        _ organizationID: String?,
+        _ workspaceID: String?) -> Void
+    let updateAccount: (
+        _ accountID: UUID,
+        _ usageScope: String?,
+        _ organizationID: String?,
+        _ workspaceID: String?) -> Void
     let removeAccount: (_ accountID: UUID) -> Void
+    let primaryAddActionTitle: String?
+    let primaryAddAction: (() async -> Void)?
     let openConfigFile: () -> Void
     let reloadFromDisk: () -> Void
 }
 
+/// Shared organizations descriptor rendered in the Providers settings pane.
+///
+/// Used by providers that let the user opt in to additional account scopes
+/// (e.g. Kilo organizations) shown alongside the personal account.
+@MainActor
+struct ProviderSettingsOrganizationsDescriptor: Identifiable {
+    struct Entry: Identifiable {
+        let id: String
+        let title: String
+        let subtitle: String?
+        let localizesTitle: Bool
+        let localizesSubtitle: Bool
+        let isEnabled: Bool
+        let isLocked: Bool
+
+        init(
+            id: String,
+            title: String,
+            subtitle: String?,
+            localizesTitle: Bool = true,
+            localizesSubtitle: Bool = true,
+            isEnabled: Bool,
+            isLocked: Bool)
+        {
+            self.id = id
+            self.title = title
+            self.subtitle = subtitle
+            self.localizesTitle = localizesTitle
+            self.localizesSubtitle = localizesSubtitle
+            self.isEnabled = isEnabled
+            self.isLocked = isLocked
+        }
+    }
+
+    struct RefreshOutcome {
+        let success: Bool
+        let errorMessage: String?
+    }
+
+    let id: String
+    let title: String
+    let subtitle: String?
+    let entries: () -> [Entry]
+    let onToggle: (String, Bool) -> Void
+    let onRefresh: () async -> RefreshOutcome
+    let canRefresh: () -> Bool
+}
+
 /// Shared picker descriptor rendered in the Providers settings pane.
+enum ProviderSettingsPickerPlacement: Equatable {
+    case menuBar
+    case connection
+}
+
 @MainActor
 struct ProviderSettingsPickerDescriptor: Identifiable {
     let id: String
     let title: String
     let subtitle: String
+    let placement: ProviderSettingsPickerPlacement
     let dynamicSubtitle: (() -> String?)?
     let binding: Binding<String>
     let options: [ProviderSettingsPickerOption]
@@ -116,22 +250,26 @@ struct ProviderSettingsPickerDescriptor: Identifiable {
     let isEnabled: (() -> Bool)?
     let onChange: ((_ selection: String) async -> Void)?
     let trailingText: (() -> String?)?
+    let trailingActions: [ProviderSettingsActionDescriptor]
 
     init(
         id: String,
         title: String,
         subtitle: String,
+        placement: ProviderSettingsPickerPlacement = .connection,
         dynamicSubtitle: (() -> String?)? = nil,
         binding: Binding<String>,
         options: [ProviderSettingsPickerOption],
         isVisible: (() -> Bool)?,
         isEnabled: (() -> Bool)? = nil,
         onChange: ((_ selection: String) async -> Void)?,
-        trailingText: (() -> String?)? = nil)
+        trailingText: (() -> String?)? = nil,
+        trailingActions: [ProviderSettingsActionDescriptor] = [])
     {
         self.id = id
         self.title = title
         self.subtitle = subtitle
+        self.placement = placement
         self.dynamicSubtitle = dynamicSubtitle
         self.binding = binding
         self.options = options
@@ -139,6 +277,7 @@ struct ProviderSettingsPickerDescriptor: Identifiable {
         self.isEnabled = isEnabled
         self.onChange = onChange
         self.trailingText = trailingText
+        self.trailingActions = trailingActions
     }
 }
 

@@ -5,11 +5,13 @@ public struct WidgetSnapshot: Codable, Sendable {
         public let id: String
         public let title: String
         public let percentLeft: Double?
+        public let window: RateWindow?
 
-        public init(id: String, title: String, percentLeft: Double?) {
+        public init(id: String, title: String, percentLeft: Double?, window: RateWindow? = nil) {
             self.id = id
             self.title = title
             self.percentLeft = percentLeft
+            self.window = window
         }
     }
 
@@ -24,6 +26,7 @@ public struct WidgetSnapshot: Codable, Sendable {
         public let codeReviewRemainingPercent: Double?
         public let tokenUsage: TokenUsageSummary?
         public let dailyUsage: [DailyUsagePoint]
+        public let providerCost: ProviderCostSnapshot?
 
         public init(
             provider: UsageProvider,
@@ -35,7 +38,8 @@ public struct WidgetSnapshot: Codable, Sendable {
             creditsRemaining: Double?,
             codeReviewRemainingPercent: Double?,
             tokenUsage: TokenUsageSummary?,
-            dailyUsage: [DailyUsagePoint])
+            dailyUsage: [DailyUsagePoint],
+            providerCost: ProviderCostSnapshot? = nil)
         {
             self.provider = provider
             self.updatedAt = updatedAt
@@ -47,25 +51,78 @@ public struct WidgetSnapshot: Codable, Sendable {
             self.codeReviewRemainingPercent = codeReviewRemainingPercent
             self.tokenUsage = tokenUsage
             self.dailyUsage = dailyUsage
+            self.providerCost = providerCost
         }
     }
 
     public struct TokenUsageSummary: Codable, Sendable {
+        /// Token-cost rows refresh on a slower cadence than quota rows; beyond this lag the
+        /// widget discloses their own age instead of inheriting `ProviderEntry.updatedAt`.
+        public static let staleLagThreshold: TimeInterval = 10 * 60
+
         public let sessionCostUSD: Double?
         public let sessionTokens: Int?
         public let last30DaysCostUSD: Double?
         public let last30DaysTokens: Int?
+        public let currencyCode: String
+        public let sessionLabel: String
+        public let last30DaysLabel: String
+        public let updatedAt: Date?
 
         public init(
             sessionCostUSD: Double?,
             sessionTokens: Int?,
             last30DaysCostUSD: Double?,
-            last30DaysTokens: Int?)
+            last30DaysTokens: Int?,
+            currencyCode: String = "USD",
+            sessionLabel: String = "Today",
+            last30DaysLabel: String = "30d",
+            updatedAt: Date? = nil)
         {
             self.sessionCostUSD = sessionCostUSD
             self.sessionTokens = sessionTokens
             self.last30DaysCostUSD = last30DaysCostUSD
             self.last30DaysTokens = last30DaysTokens
+            self.currencyCode = currencyCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "USD"
+                : currencyCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            self.sessionLabel = sessionLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Today"
+                : sessionLabel
+            self.last30DaysLabel = last30DaysLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "30d"
+                : last30DaysLabel
+            self.updatedAt = updatedAt
+        }
+
+        /// Unknown age (legacy snapshots) counts as fresh.
+        public func isStale(comparedTo entryUpdatedAt: Date) -> Bool {
+            guard let updatedAt else { return false }
+            return entryUpdatedAt.timeIntervalSince(updatedAt) > Self.staleLagThreshold
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case sessionCostUSD
+            case sessionTokens
+            case last30DaysCostUSD
+            case last30DaysTokens
+            case currencyCode
+            case sessionLabel
+            case last30DaysLabel
+            case updatedAt
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            try self.init(
+                sessionCostUSD: container.decodeIfPresent(Double.self, forKey: .sessionCostUSD),
+                sessionTokens: container.decodeIfPresent(Int.self, forKey: .sessionTokens),
+                last30DaysCostUSD: container.decodeIfPresent(Double.self, forKey: .last30DaysCostUSD),
+                last30DaysTokens: container.decodeIfPresent(Int.self, forKey: .last30DaysTokens),
+                currencyCode: container.decodeIfPresent(String.self, forKey: .currencyCode) ?? "USD",
+                sessionLabel: container.decodeIfPresent(String.self, forKey: .sessionLabel) ?? "Today",
+                last30DaysLabel: container.decodeIfPresent(String.self, forKey: .last30DaysLabel) ?? "30d",
+                updatedAt: container.decodeIfPresent(Date.self, forKey: .updatedAt))
         }
     }
 
@@ -83,17 +140,25 @@ public struct WidgetSnapshot: Codable, Sendable {
 
     public let entries: [ProviderEntry]
     public let enabledProviders: [UsageProvider]
+    public let usageBarsShowUsed: Bool
     public let generatedAt: Date
 
-    public init(entries: [ProviderEntry], enabledProviders: [UsageProvider]? = nil, generatedAt: Date) {
+    public init(
+        entries: [ProviderEntry],
+        enabledProviders: [UsageProvider]? = nil,
+        usageBarsShowUsed: Bool = false,
+        generatedAt: Date)
+    {
         self.entries = entries
         self.enabledProviders = enabledProviders ?? entries.map(\.provider)
+        self.usageBarsShowUsed = usageBarsShowUsed
         self.generatedAt = generatedAt
     }
 
     private enum CodingKeys: String, CodingKey {
         case entries
         case enabledProviders
+        case usageBarsShowUsed
         case generatedAt
     }
 
@@ -103,12 +168,14 @@ public struct WidgetSnapshot: Codable, Sendable {
         self.generatedAt = try container.decode(Date.self, forKey: .generatedAt)
         self.enabledProviders = try container.decodeIfPresent([UsageProvider].self, forKey: .enabledProviders)
             ?? self.entries.map(\.provider)
+        self.usageBarsShowUsed = try container.decodeIfPresent(Bool.self, forKey: .usageBarsShowUsed) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(self.entries, forKey: .entries)
         try container.encode(self.enabledProviders, forKey: .enabledProviders)
+        try container.encode(self.usageBarsShowUsed, forKey: .usageBarsShowUsed)
         try container.encode(self.generatedAt, forKey: .generatedAt)
     }
 }

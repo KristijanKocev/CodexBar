@@ -1,9 +1,8 @@
-import CodexBarMacroSupport
 import Foundation
 
-@ProviderDescriptorRegistration
-@ProviderDescriptorDefinition
 public enum SyntheticProviderDescriptor {
+    public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
+
     static func makeDescriptor() -> ProviderDescriptor {
         ProviderDescriptor(
             id: .synthetic,
@@ -26,43 +25,25 @@ public enum SyntheticProviderDescriptor {
             branding: ProviderBranding(
                 iconStyle: .synthetic,
                 iconResourceName: "ProviderIcon-synthetic",
-                color: ProviderColor(red: 20 / 255, green: 20 / 255, blue: 20 / 255)),
+                color: ProviderColor(red: 20 / 255, green: 20 / 255, blue: 20 / 255),
+                confettiPalette: [
+                    ProviderColor(hex: 0x6366F1),
+                    ProviderColor(hex: 0x3E3E3E),
+                    ProviderColor(hex: 0xF7F6F3),
+                ]),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Synthetic cost summary is not supported." }),
-            fetchPlan: ProviderFetchPlan(
-                sourceModes: [.auto, .api],
-                pipeline: ProviderFetchPipeline(resolveStrategies: { _ in [SyntheticAPIFetchStrategy()] })),
+            fetchPlan: .apiToken(
+                strategyID: "synthetic.api",
+                resolveToken: { ProviderTokenResolver.syntheticToken(environment: $0) },
+                missingCredentialsError: { SyntheticSettingsError.missingToken },
+                loadUsage: { apiKey, _ in
+                    try await SyntheticUsageFetcher.fetchUsage(apiKey: apiKey).toUsageSnapshot()
+                }),
             cli: ProviderCLIConfig(
                 name: "synthetic",
                 aliases: ["synthetic.new"],
                 versionDetector: nil))
-    }
-}
-
-struct SyntheticAPIFetchStrategy: ProviderFetchStrategy {
-    let id: String = "synthetic.api"
-    let kind: ProviderFetchKind = .apiToken
-
-    func isAvailable(_ context: ProviderFetchContext) async -> Bool {
-        Self.resolveToken(environment: context.env) != nil
-    }
-
-    func fetch(_ context: ProviderFetchContext) async throws -> ProviderFetchResult {
-        guard let apiKey = Self.resolveToken(environment: context.env) else {
-            throw SyntheticSettingsError.missingToken
-        }
-        let usage = try await SyntheticUsageFetcher.fetchUsage(apiKey: apiKey)
-        return self.makeResult(
-            usage: usage.toUsageSnapshot(),
-            sourceLabel: "api")
-    }
-
-    func shouldFallback(on _: Error, context _: ProviderFetchContext) -> Bool {
-        false
-    }
-
-    private static func resolveToken(environment: [String: String]) -> String? {
-        ProviderTokenResolver.syntheticToken(environment: environment)
     }
 }

@@ -4,6 +4,7 @@ public struct ClaudeStatusSnapshot: Sendable {
     public let sessionPercentLeft: Int?
     public let weeklyPercentLeft: Int?
     public let opusPercentLeft: Int?
+    public let extraRateWindows: [NamedRateWindow]
     public let accountEmail: String?
     public let accountOrganization: String?
     public let loginMethod: String?
@@ -11,6 +12,32 @@ public struct ClaudeStatusSnapshot: Sendable {
     public let secondaryResetDescription: String?
     public let opusResetDescription: String?
     public let rawText: String
+
+    public init(
+        sessionPercentLeft: Int?,
+        weeklyPercentLeft: Int?,
+        opusPercentLeft: Int?,
+        accountEmail: String?,
+        accountOrganization: String?,
+        loginMethod: String?,
+        primaryResetDescription: String?,
+        secondaryResetDescription: String?,
+        opusResetDescription: String?,
+        rawText: String,
+        extraRateWindows: [NamedRateWindow] = [])
+    {
+        self.sessionPercentLeft = sessionPercentLeft
+        self.weeklyPercentLeft = weeklyPercentLeft
+        self.opusPercentLeft = opusPercentLeft
+        self.extraRateWindows = extraRateWindows
+        self.accountEmail = accountEmail
+        self.accountOrganization = accountOrganization
+        self.loginMethod = loginMethod
+        self.primaryResetDescription = primaryResetDescription
+        self.secondaryResetDescription = secondaryResetDescription
+        self.opusResetDescription = opusResetDescription
+        self.rawText = rawText
+    }
 }
 
 public struct ClaudeAccountIdentity: Sendable {
@@ -27,6 +54,7 @@ public struct ClaudeAccountIdentity: Sendable {
 
 public enum ClaudeStatusProbeError: LocalizedError, Sendable {
     case claudeNotInstalled
+    case authenticationFailed(String)
     case parseFailed(String)
     case timedOut
 
@@ -34,6 +62,8 @@ public enum ClaudeStatusProbeError: LocalizedError, Sendable {
         switch self {
         case .claudeNotInstalled:
             "Claude CLI is not installed or not on PATH."
+        case let .authenticationFailed(message):
+            message
         case let .parseFailed(msg):
             "Could not parse Claude usage: \(msg)"
         case .timedOut:
@@ -44,6 +74,10 @@ public enum ClaudeStatusProbeError: LocalizedError, Sendable {
 
 /// Runs `claude` inside a PTY, sends `/usage`, and parses the rendered text panel.
 public struct ClaudeStatusProbe: Sendable {
+    public static let subscriptionQuotaUnavailableDescription =
+        "Claude CLI /usage returned a subscription notice without session quota data. " +
+        "Local cost and token history remain available."
+
     public var claudeBinary: String = "claude"
     public var timeout: TimeInterval = 20.0
     public var keepCLISessionsAlive: Bool = false
@@ -103,6 +137,9 @@ public struct ClaudeStatusProbe: Sendable {
                 Self.log.debug("Claude CLI /usage looked like startup output; retrying once")
                 usage = try await Self.capture(subcommand: "/usage", binary: resolved, timeout: max(timeout, 14))
             }
+            // `/status` only enriches a valid usage snapshot with identity. Terminal usage errors and loading stalls
+            // cannot be repaired by it, so fail now instead of paying for another interactive CLI round trip.
+            try Self.validateUsageBeforeStatusProbe(usage)
             let status = try? await Self.capture(subcommand: "/status", binary: resolved, timeout: min(timeout, 12))
             let snap = try Self.parse(text: usage, statusText: status)
 
@@ -112,17 +149,26 @@ public struct ClaudeStatusProbe: Sendable {
                 "opusPercentLeft": "\(snap.opusPercentLeft ?? -1)",
             ])
             if !keepAlive {
-                await ClaudeCLISession.shared.reset()
+                await Self.resetTransientCLISessionAndCleanupProbeArtifacts()
             }
             return snap
         } catch {
             if !keepAlive {
-                await ClaudeCLISession.shared.reset()
+                await Self.resetTransientCLISessionAndCleanupProbeArtifacts()
             }
             throw error
         }
     }
 
+    private static func resetTransientCLISessionAndCleanupProbeArtifacts() async {
+        await ClaudeCLISession.current.reset()
+        let removed = ClaudeProbeSessionArtifactCleaner.cleanupProbeSessionArtifacts()
+        guard !removed.isEmpty else { return }
+        Self.log.debug("Claude probe session artifacts removed", metadata: ["count": "\(removed.count)"])
+    }
+}
+
+extension ClaudeStatusProbe {
     // MARK: - Parsing helpers
 
     private struct LabelSearchContext {
@@ -155,40 +201,48 @@ public struct ClaudeStatusProbe: Sendable {
                 reason: "usageError: \(usageError)",
                 usage: clean,
                 status: statusText)
-            throw ClaudeStatusProbeError.parseFailed(usageError)
+            throw self.usageProbeError(message: usageError)
+        }
+
+        let latestUsagePanel = self.trimToLatestUsagePanel(clean)
+        if self.isUsageStillLoading(text: latestUsagePanel ?? clean) {
+            Self.dumpIfNeeded(
+                enabled: shouldDump,
+                reason: "usage still loading",
+                usage: clean,
+                status: statusText)
+            throw ClaudeStatusProbeError.parseFailed("Claude CLI /usage is still loading usage data.")
         }
 
         // Claude CLI renders /usage as a TUI. Our PTY capture includes earlier screen fragments (including a status
         // line
         // with a "0%" context meter) before the usage panel is drawn. To keep parsing stable, trim to the last
         // Settings/Usage panel when present.
-        let usagePanelText = self.trimToLatestUsagePanel(clean) ?? clean
+        let usagePanelText = latestUsagePanel ?? clean
         let labelContext = LabelSearchContext(text: usagePanelText)
 
         var sessionPct = self.extractPercent(labelSubstring: "Current session", context: labelContext)
-        var weeklyPct = self.extractPercent(labelSubstring: "Current week (all models)", context: labelContext)
-        var opusPct = self.extractPercent(
-            labelSubstrings: [
-                "Current week (Opus)",
-                "Current week (Sonnet only)",
-                "Current week (Sonnet)",
-            ],
-            context: labelContext)
+        let weeklyPct = self.extractPercent(labelSubstring: "Current week (all models)", context: labelContext)
+        let opusLabels = [
+            "Current week (Opus)",
+            "Current week (Sonnet only)",
+            "Current week (Sonnet)",
+        ]
+        let opusPct = self.extractPercent(labelSubstrings: opusLabels, context: labelContext)
 
         // Fallback: order-based percent scraping when labels are present but the surrounding layout moved.
         // Only apply the fallback when the corresponding label exists in the rendered panel; enterprise accounts
         // may omit the weekly panel entirely, and we should treat that as "unavailable" rather than guessing.
-        let compactContext = usagePanelText.lowercased().filter { !$0.isWhitespace }
-        let hasWeeklyLabel =
-            labelContext.contains("currentweek")
-            || compactContext.contains("currentweek")
-        let hasOpusLabel = labelContext.contains("opus") || labelContext.contains("sonnet")
+        let weeklyModels = Set(labelContext.lines.compactMap(self.weeklyModelName).map(self.normalizedForLabelSearch))
+        let hasAllModelsWeeklyLabel = weeklyModels.contains(where: self.isAllModelsWeeklyModel)
+        let opusModels = Set(opusLabels.compactMap(self.weeklyModelName).map(self.normalizedForLabelSearch))
+        let hasOpusLabel = !weeklyModels.isDisjoint(with: opusModels)
 
-        if sessionPct == nil || (hasWeeklyLabel && weeklyPct == nil) || (hasOpusLabel && opusPct == nil) {
+        if sessionPct == nil {
             let ordered = self.allPercents(usagePanelText)
-            if sessionPct == nil, ordered.indices.contains(0) { sessionPct = ordered[0] }
-            if hasWeeklyLabel, weeklyPct == nil, ordered.indices.contains(1) { weeklyPct = ordered[1] }
-            if hasOpusLabel, opusPct == nil, ordered.indices.contains(2) { opusPct = ordered[2] }
+            if sessionPct == nil, ordered.indices.contains(0) {
+                sessionPct = ordered[0]
+            }
         }
 
         let identity = Self.parseIdentity(usageText: clean, statusText: statusClean)
@@ -209,18 +263,16 @@ public struct ClaudeStatusProbe: Sendable {
         }
 
         let sessionReset = self.extractReset(labelSubstring: "Current session", context: labelContext)
-        let weeklyReset = hasWeeklyLabel
+        let weeklyReset = hasAllModelsWeeklyLabel
             ? self.extractReset(labelSubstring: "Current week (all models)", context: labelContext)
             : nil
         let opusReset = hasOpusLabel
-            ? self.extractReset(
-                labelSubstrings: [
-                    "Current week (Opus)",
-                    "Current week (Sonnet only)",
-                    "Current week (Sonnet)",
-                ],
-                context: labelContext)
+            ? self.extractReset(labelSubstrings: opusLabels, context: labelContext)
             : nil
+        let scopedWeeklyUsages = self.extractScopedWeeklyUsages(context: labelContext)
+        let extraRateWindows = self.extraRateWindows(
+            fromScopedWeeklyUsages: scopedWeeklyUsages,
+            fallbackResetDescription: weeklyReset)
 
         return ClaudeStatusSnapshot(
             sessionPercentLeft: sessionPct,
@@ -232,7 +284,8 @@ public struct ClaudeStatusProbe: Sendable {
             primaryResetDescription: sessionReset,
             secondaryResetDescription: weeklyReset,
             opusResetDescription: opusReset,
-            rawText: text + (statusText ?? ""))
+            rawText: text + (statusText ?? ""),
+            extraRateWindows: extraRateWindows)
     }
 
     public static func parseIdentity(usageText: String?, statusText: String?) -> ClaudeAccountIdentity {
@@ -288,14 +341,44 @@ public struct ClaudeStatusProbe: Sendable {
     }
 
     private static func extractPercent(labelSubstring: String, context: LabelSearchContext) -> Int? {
+        // Prefer an exact label match; only fall back to a fuzzy (garbled-capture) match when no exact
+        // copy yields a value, so a clean row always wins over a corrupted duplicate regardless of order.
+        self.extractPercent(labelSubstring: labelSubstring, context: context, allowFuzzy: false)
+            ?? self.extractPercent(labelSubstring: labelSubstring, context: context, allowFuzzy: true)
+    }
+
+    private static func extractPercent(
+        labelSubstring: String,
+        context: LabelSearchContext,
+        allowFuzzy: Bool) -> Int?
+    {
         let lines = context.lines
         let label = self.normalizedForLabelSearch(labelSubstring)
-        for (idx, normalizedLine) in context.normalizedLines.enumerated() where normalizedLine.contains(label) {
+        for (idx, line) in lines.enumerated() {
+            let normalizedLine = context.normalizedLines[idx]
+            guard self.matchesLabel(
+                line: line,
+                normalizedLine: normalizedLine,
+                labelSubstring: labelSubstring,
+                normalizedLabel: label,
+                allowFuzzy: allowFuzzy)
+            else { continue }
+
             // Claude's usage panel can take a moment to render percentages (especially on enterprise accounts),
             // so scan a larger window than the original 3–4 lines.
             let window = lines.dropFirst(idx).prefix(12)
             for candidate in window {
-                if let pct = self.percentFromLine(candidate) { return pct }
+                if self.crossesLabelBoundary(
+                    line: candidate,
+                    labelSubstring: labelSubstring,
+                    normalizedLabel: label,
+                    allowFuzzy: allowFuzzy)
+                {
+                    break
+                }
+                if let pct = self.percentFromLine(candidate) {
+                    return pct
+                }
             }
         }
         return nil
@@ -307,17 +390,125 @@ public struct ClaudeStatusProbe: Sendable {
             || normalized.contains("currentweek")
             || normalized.contains("loadingusage")
             || normalized.contains("failedtoloadusagedata")
+            || self.usageCaptureHasSubscriptionNotice(normalized)
+    }
+
+    private static func validateUsageBeforeStatusProbe(_ text: String) throws {
+        let clean = TextParsing.stripANSICodes(text)
+        if let usageError = self.extractUsageError(text: clean) {
+            throw self.usageProbeError(message: usageError)
+        }
+
+        let latestUsagePanel = self.trimToLatestUsagePanel(clean)
+        if self.isUsageStillLoading(text: latestUsagePanel ?? clean) {
+            throw ClaudeStatusProbeError.parseFailed("Claude CLI /usage is still loading usage data.")
+        }
     }
 
     private static func extractPercent(labelSubstrings: [String], context: LabelSearchContext) -> Int? {
         for label in labelSubstrings {
-            if let value = self.extractPercent(labelSubstring: label, context: context) { return value }
+            if let value = self.extractPercent(labelSubstring: label, context: context) {
+                return value
+            }
         }
         return nil
     }
 
+    private struct ScopedWeeklyUsage {
+        let modelName: String
+        let percentLeft: Int
+        let resetDescription: String?
+    }
+
+    private static func extractScopedWeeklyUsages(context: LabelSearchContext) -> [ScopedWeeklyUsage] {
+        var usageIndexByModel: [String: Int] = [:]
+        var usages: [ScopedWeeklyUsage] = []
+        for (index, line) in context.lines.enumerated() {
+            guard let modelName = self.weeklyModelName(from: line) else { continue }
+            let normalizedModel = self.normalizedForLabelSearch(modelName)
+            guard !normalizedModel.isEmpty, !self.isAllModelsWeeklyModel(normalizedModel) else { continue }
+
+            let window = context.lines.dropFirst(index).prefix(14)
+            var percentLeft: Int?
+            var resetDescription: String?
+            for candidate in window {
+                if self.crossesLabelBoundary(
+                    line: candidate,
+                    labelSubstring: line,
+                    normalizedLabel: self.normalizedForLabelSearch(line))
+                {
+                    break
+                }
+                if percentLeft == nil {
+                    percentLeft = self.percentFromLine(candidate)
+                }
+                if resetDescription == nil {
+                    resetDescription = self.resetFromLine(candidate)
+                }
+            }
+            guard let percentLeft else { continue }
+            let usage = ScopedWeeklyUsage(
+                modelName: modelName,
+                percentLeft: percentLeft,
+                resetDescription: resetDescription)
+            if let existingIndex = usageIndexByModel[normalizedModel] {
+                usages[existingIndex] = usage
+            } else {
+                usageIndexByModel[normalizedModel] = usages.endIndex
+                usages.append(usage)
+            }
+        }
+        return usages
+    }
+
+    private static func extraRateWindows(
+        fromScopedWeeklyUsages usages: [ScopedWeeklyUsage],
+        fallbackResetDescription: String?) -> [NamedRateWindow]
+    {
+        usages.compactMap { usage in
+            let normalizedModel = self.normalizedForLabelSearch(usage.modelName)
+            guard normalizedModel != "opus",
+                  normalizedModel != "sonnet",
+                  normalizedModel != "sonnetonly"
+            else { return nil }
+
+            let usedPercent = max(0, min(100, 100 - Double(usage.percentLeft)))
+            let modelTitle = normalizedModel.hasSuffix("only")
+                ? usage.modelName
+                : "\(usage.modelName) only"
+            let resetDescription = usage.resetDescription ?? fallbackResetDescription
+            return NamedRateWindow(
+                id: "claude-weekly-scoped-\(self.slug(usage.modelName))",
+                title: modelTitle,
+                window: RateWindow(
+                    usedPercent: usedPercent,
+                    windowMinutes: 7 * 24 * 60,
+                    resetsAt: self.parseResetDate(
+                        from: resetDescription,
+                        expectedWindow: 7 * 24 * 60 * 60),
+                    resetDescription: resetDescription))
+        }
+    }
+
+    private static func slug(_ value: String) -> String {
+        var result = ""
+        var lastWasDash = false
+        for scalar in value.lowercased().unicodeScalars {
+            if CharacterSet.alphanumerics.contains(scalar) {
+                result.unicodeScalars.append(scalar)
+                lastWasDash = false
+            } else if !lastWasDash {
+                result.append("-")
+                lastWasDash = true
+            }
+        }
+        return result.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    }
+
     private static func percentFromLine(_ line: String, assumeRemainingWhenUnclear: Bool = false) -> Int? {
-        if self.isLikelyStatusContextLine(line) { return nil }
+        if self.isLikelyStatusContextLine(line) {
+            return nil
+        }
 
         // Allow optional Unicode whitespace before % to handle CLI formatting changes.
         let pattern = #"([0-9]{1,3}(?:\.[0-9]+)?)\p{Zs}*%"#
@@ -399,7 +590,9 @@ public struct ClaudeStatusProbe: Sendable {
                 return nil
             }
             // Suppress org if it’s just the email prefix (common in CLI panels).
-            if let email, orgText.lowercased().hasPrefix(email.lowercased()) { return nil }
+            if let email, orgText.lowercased().hasPrefix(email.lowercased()) {
+                return nil
+            }
             return orgText
         }()
         // Prefer explicit login method from /status, then fall back to /usage header heuristics.
@@ -408,7 +601,9 @@ public struct ClaudeStatusProbe: Sendable {
     }
 
     private static func extractUsageError(text: String) -> String? {
-        if let jsonHint = self.extractUsageErrorJSON(text: text) { return jsonHint }
+        if let jsonHint = self.extractUsageErrorJSON(text: text) {
+            return jsonHint
+        }
 
         let lower = text.lowercased()
         let compact = lower.filter { !$0.isWhitespace }
@@ -431,17 +626,22 @@ public struct ClaudeStatusProbe: Sendable {
             appearing open `claude` once, choose “Yes, proceed”, then retry.
             """
         }
-        if lower.contains("token_expired") || lower.contains("token has expired") {
+        let failureLine = self.usageFailureLine(text: text)?.lowercased() ?? ""
+        if failureLine.contains("token_expired") || failureLine.contains("token has expired") {
             return "Claude CLI token expired. Run `claude login` to refresh."
         }
-        if lower.contains("authentication_error") {
+        if failureLine.contains("authentication_error") {
             return "Claude CLI authentication error. Run `claude login`."
         }
-        if lower.contains("rate_limit_error")
-            || lower.contains("rate limited")
-            || compact.contains("ratelimited")
+        let compactFailureLine = failureLine.filter { !$0.isWhitespace }
+        if failureLine.contains("rate_limit_error")
+            || failureLine.contains("rate limited")
+            || compactFailureLine.contains("ratelimited")
         {
             return "Claude CLI usage endpoint is rate limited right now. Please try again later."
+        }
+        if self.isSubscriptionNoticeOnly(text: text) {
+            return self.subscriptionQuotaUnavailableDescription
         }
         if lower.contains("failed to load usage data") {
             return "Claude CLI could not load usage data. Open the CLI and retry `/usage`."
@@ -450,6 +650,74 @@ public struct ClaudeStatusProbe: Sendable {
             return "Claude CLI could not load usage data. Open the CLI and retry `/usage`."
         }
         return nil
+    }
+
+    private static func usageFailureLine(text: String) -> String? {
+        let pattern = #"failed\s*to\s*load\s*usage\s*data[^\r\n]*"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.matches(in: text, range: range).last,
+              let matchRange = Range(match.range, in: text)
+        else { return nil }
+        return String(text[matchRange])
+    }
+
+    private static func usageProbeError(message: String) -> ClaudeStatusProbeError {
+        let lower = message.lowercased()
+        let authenticationMarkers = [
+            "authentication_error",
+            "permission_error",
+            "token_expired",
+            "token expired",
+            "token has expired",
+            "oauth account information not found",
+            "does not have access to claude code",
+            "run /login",
+            "run `claude login`",
+            "run claude login",
+            "api error: 401",
+            "api error: 403",
+            "forbidden",
+            "invalid api key",
+            "invalid_api_key",
+            "invalid credential",
+            "not authenticated",
+            "not authorized",
+            "token revoked",
+            "unauthorized",
+        ]
+        if authenticationMarkers.contains(where: { lower.contains($0) }) {
+            return .authenticationFailed(message)
+        }
+        return .parseFailed(message)
+    }
+
+    private static func isUsageStillLoading(text: String) -> Bool {
+        let normalized = TextParsing.stripANSICodes(text).lowercased().filter { !$0.isWhitespace }
+        guard normalized.contains("loadingusage") else { return false }
+        return !self.usageCaptureHasSessionValue(normalized) && self.allPercents(text).isEmpty
+    }
+
+    /// Returns true when the text contains only a subscription notice with no session/weekly quota data.
+    /// CLI 2.1+ can return "You are currently using your subscription to power your Claude Code usage"
+    /// which lacks the "Current session" / "Current week" labels and percentage values needed for quota display.
+    /// A PTY capture may contain both an intermediate "Loading usage data…" panel and the final subscription
+    /// notice; `loadingusage` is not treated as quota data in this check so mixed captures surface correctly.
+    private static func isSubscriptionNoticeOnly(text: String) -> Bool {
+        let normalized = text.lowercased().filter { !$0.isWhitespace }
+        guard normalized.contains("currentlyusingyoursubscription") else { return false }
+        guard normalized.contains("claudecodeusage") else { return false }
+        // Only real session/week labels and actual percentage values count as quota data.
+        // `loadingusage` is not quota data — a mixed loading+subscription PTY capture should
+        // surface the subscription error, not a still-loading stall.
+        let hasQuotaData = normalized.contains("currentsession") || normalized.contains("currentweek")
+            || normalized.contains("%used") || normalized.contains("%left") || normalized.contains("%remaining")
+            || normalized.contains("%available")
+        return !hasQuotaData
+    }
+
+    public static func isSubscriptionQuotaUnavailableDescription(_ text: String?) -> Bool {
+        text?.localizedCaseInsensitiveContains("subscription notice without session quota data") == true
     }
 
     /// Collect remaining percentages in the order they appear; used as a backup when labels move/rename.
@@ -462,7 +730,9 @@ public struct ClaudeStatusProbe: Sendable {
             || normalized.contains("remaining") || normalized.contains("available")
         let loadingOnly = hasLoading && !hasUsageWindows
         guard hasUsageWindows || hasLoading else { return [] }
-        if loadingOnly { return [] }
+        if loadingOnly {
+            return []
+        }
         guard hasUsagePercentKeywords else { return [] }
 
         // Keep this strict to avoid matching Claude's status-line context meter (e.g. "0%") as session usage when the
@@ -489,29 +759,150 @@ public struct ClaudeStatusProbe: Sendable {
     }
 
     private static func extractReset(labelSubstring: String, context: LabelSearchContext) -> String? {
+        // Exact match wins over a garbled duplicate, mirroring extractPercent's candidate selection.
+        self.extractReset(labelSubstring: labelSubstring, context: context, allowFuzzy: false)
+            ?? self.extractReset(labelSubstring: labelSubstring, context: context, allowFuzzy: true)
+    }
+
+    private static func extractReset(
+        labelSubstring: String,
+        context: LabelSearchContext,
+        allowFuzzy: Bool) -> String?
+    {
         let lines = context.lines
         let label = self.normalizedForLabelSearch(labelSubstring)
-        for (idx, normalizedLine) in context.normalizedLines.enumerated() where normalizedLine.contains(label) {
+        for (idx, line) in lines.enumerated() {
+            let normalizedLine = context.normalizedLines[idx]
+            guard self.matchesLabel(
+                line: line,
+                normalizedLine: normalizedLine,
+                labelSubstring: labelSubstring,
+                normalizedLabel: label,
+                allowFuzzy: allowFuzzy)
+            else { continue }
+
             let window = lines.dropFirst(idx).prefix(14)
             for candidate in window {
-                let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-                let normalized = self.normalizedForLabelSearch(trimmed)
-                if normalized.hasPrefix("current"), !normalized.contains(label) { break }
-                if let reset = self.resetFromLine(candidate) { return reset }
+                if self.crossesLabelBoundary(
+                    line: candidate,
+                    labelSubstring: labelSubstring,
+                    normalizedLabel: label,
+                    allowFuzzy: allowFuzzy)
+                {
+                    break
+                }
+                if let reset = self.resetFromLine(candidate) {
+                    return reset
+                }
             }
         }
         return nil
     }
 
+    private static func matchesLabel(
+        line: String,
+        normalizedLine: String,
+        labelSubstring: String,
+        normalizedLabel: String,
+        allowFuzzy: Bool = false) -> Bool
+    {
+        guard let expectedModel = self.weeklyModelName(from: labelSubstring) else {
+            return normalizedLine.contains(normalizedLabel)
+        }
+        guard let actualModel = self.weeklyModelName(from: line) else { return false }
+        let expectedNormalized = self.normalizedForLabelSearch(expectedModel)
+        let actualNormalized = self.normalizedForLabelSearch(actualModel)
+        // When looking up the all-models weekly bucket, tolerate garbled TUI captures ("all modls")
+        // so the Weekly percent/reset are still recovered even if the clean copy never survived. The
+        // fuzzy match is opt-in so callers can prefer an exact copy before accepting a corrupted one.
+        if allowFuzzy, self.isAllModelsWeeklyModel(expectedNormalized) {
+            return self.isAllModelsWeeklyModel(actualNormalized)
+        }
+        return actualNormalized == expectedNormalized
+    }
+
+    private static func crossesLabelBoundary(
+        line: String,
+        labelSubstring: String,
+        normalizedLabel: String,
+        allowFuzzy: Bool = false) -> Bool
+    {
+        let normalizedLine = self.normalizedForLabelSearch(line)
+        guard normalizedLine.hasPrefix("current") else { return false }
+        guard let expectedModel = self.weeklyModelName(from: labelSubstring) else {
+            return !normalizedLine.contains(normalizedLabel)
+        }
+        guard let actualModel = self.weeklyModelName(from: line) else { return true }
+        let expectedNormalized = self.normalizedForLabelSearch(expectedModel)
+        let actualNormalized = self.normalizedForLabelSearch(actualModel)
+        if allowFuzzy, self.isAllModelsWeeklyModel(expectedNormalized) {
+            return !self.isAllModelsWeeklyModel(actualNormalized)
+        }
+        return actualNormalized != expectedNormalized
+    }
+
+    private static func weeklyModelName(from line: String) -> String? {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"current\s*week\s*\(([^)]+)\)"#,
+            options: [.caseInsensitive])
+        else { return nil }
+        let range = NSRange(line.startIndex..<line.endIndex, in: line)
+        guard let match = regex.firstMatch(in: line, options: [], range: range),
+              match.numberOfRanges >= 2,
+              let modelRange = Range(match.range(at: 1), in: line)
+        else { return nil }
+        return String(line[modelRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Recognizes the "all models" weekly bucket even when the TUI capture dropped or duplicated a
+    /// character (e.g. "all modls"). Claude renders `/usage` as a redrawing TUI, so the same
+    /// "Current week (all models)" line can be captured mid-repaint; without tolerant matching that
+    /// garbled copy escapes the all-models filter and is surfaced as a bogus second weekly row
+    /// ("all modls only") beside the real Weekly limit. Genuine model-scoped names (Opus, Sonnet,
+    /// Fable, …) are far outside this edit-distance window.
+    private static func isAllModelsWeeklyModel(_ normalizedModel: String) -> Bool {
+        normalizedModel == "allmodels" || self.editDistance(normalizedModel, "allmodels") <= 2
+    }
+
+    /// Levenshtein distance. Inputs here are short normalized model tokens, so the naive
+    /// single-row implementation is more than fast enough.
+    private static func editDistance(_ lhs: String, _ rhs: String) -> Int {
+        let a = Array(lhs.unicodeScalars)
+        let b = Array(rhs.unicodeScalars)
+        if a.isEmpty {
+            return b.count
+        }
+        if b.isEmpty {
+            return a.count
+        }
+        var row = Array(0...b.count)
+        for i in 1...a.count {
+            var previousDiagonal = row[0]
+            row[0] = i
+            for j in 1...b.count {
+                let deletion = row[j] + 1
+                let insertion = row[j - 1] + 1
+                let substitution = previousDiagonal + (a[i - 1] == b[j - 1] ? 0 : 1)
+                previousDiagonal = row[j]
+                row[j] = Swift.min(deletion, insertion, substitution)
+            }
+        }
+        return row[b.count]
+    }
+
     private static func extractReset(labelSubstrings: [String], context: LabelSearchContext) -> String? {
         for label in labelSubstrings {
-            if let value = self.extractReset(labelSubstring: label, context: context) { return value }
+            if let value = self.extractReset(labelSubstring: label, context: context) {
+                return value
+            }
         }
         return nil
     }
 
     private static func resetFromLine(_ line: String) -> String? {
-        guard let range = line.range(of: "Resets", options: [.caseInsensitive]) else { return nil }
+        let range = line.range(of: #"(?i)\bresets?\b"#, options: .regularExpression)
+            ?? line.range(of: #"\b(?:Reset|Resets)(?=[A-Z0-9])"#, options: .regularExpression)
+        guard let range else { return nil }
         let raw = String(line[range.lowerBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
         return self.cleanResetLine(raw)
     }
@@ -520,9 +911,9 @@ public struct ClaudeStatusProbe: Sendable {
         String(text.lowercased().unicodeScalars.filter(CharacterSet.alphanumerics.contains))
     }
 
-    /// Capture all "Resets ..." strings to surface in the menu.
+    /// Capture all "Reset"/"Resets" strings to surface in the menu.
     private static func allResets(_ text: String) -> [String] {
-        let pat = #"Resets[^\r\n]*"#
+        let pat = #"\bResets?\b[^\r\n]*"#
         guard let regex = try? NSRegularExpression(pattern: pat, options: [.caseInsensitive]) else { return [] }
         let nsrange = NSRange(text.startIndex..<text.endIndex, in: text)
         var results: [String] = []
@@ -539,60 +930,237 @@ public struct ClaudeStatusProbe: Sendable {
         // TTY capture sometimes appends a stray ")" at line ends; trim it to keep snapshots stable.
         var cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         cleaned = cleaned.trimmingCharacters(in: CharacterSet(charactersIn: " )"))
+        cleaned = cleaned.replacingOccurrences(
+            of: #"(?i)\b([A-Za-z]{3}\s+\d{1,2})\s+t\s+(\d)"#,
+            with: "$1 at $2",
+            options: .regularExpression)
         let openCount = cleaned.count(where: { $0 == "(" })
         let closeCount = cleaned.count(where: { $0 == ")" })
-        if openCount > closeCount { cleaned.append(")") }
+        if openCount > closeCount {
+            cleaned.append(")")
+        }
         return cleaned
     }
 
-    /// Attempts to parse a Claude reset string into a Date, using the current year and handling optional timezones.
+    /// Parses explicit-year resets at their stated occurrence; recurring forms resolve forward in any explicit
+    /// timezone.
     public static func parseResetDate(from text: String?, now: Date = .init()) -> Date? {
+        self.parseResetDate(from: text, now: now, expectedWindow: nil)
+    }
+
+    /// Quota surfaces may accept a recently stale occurrence when the next occurrence cannot belong to that window.
+    package static func parseResetDate(
+        from text: String?,
+        now: Date = .init(),
+        expectedWindow: TimeInterval?) -> Date?
+    {
         guard let normalized = self.normalizeResetInput(text) else { return nil }
         let (raw, timeZone) = normalized
 
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = timeZone ?? TimeZone.current
-        formatter.defaultDate = now
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = formatter.timeZone
+        // Parse yearless Feb 29 independently of the current year, then resolve validated calendar occurrences.
+        formatter.defaultDate = calendar.date(from: DateComponents(year: 2000, month: 1, day: 1))
 
+        if let date = self.parseDate(raw, formats: Self.resetDateTimeWithExplicitYear, formatter: formatter) {
+            return self.resolveOccurrence(
+                self.explicitOccurrences(for: date, calendar: calendar),
+                now: now,
+                expectedWindow: expectedWindow)
+        }
         if let date = self.parseDate(raw, formats: Self.resetDateTimeWithMinutes, formatter: formatter) {
-            var comps = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
-            comps.second = 0
-            return calendar.date(from: comps)
+            let comps = calendar.dateComponents([.month, .day, .hour, .minute], from: date)
+            return self.resolveOccurrence(
+                self.yearlyOccurrences(for: comps, now: now, calendar: calendar),
+                now: now,
+                expectedWindow: expectedWindow)
         }
         if let date = self.parseDate(raw, formats: Self.resetDateTimeHourOnly, formatter: formatter) {
-            var comps = calendar.dateComponents([.year, .month, .day, .hour], from: date)
-            comps.minute = 0
-            comps.second = 0
-            return calendar.date(from: comps)
+            let comps = calendar.dateComponents([.month, .day, .hour], from: date)
+            return self.resolveOccurrence(
+                self.yearlyOccurrences(for: comps, now: now, calendar: calendar),
+                now: now,
+                expectedWindow: expectedWindow)
         }
 
         if let time = self.parseDate(raw, formats: Self.resetTimeWithMinutes, formatter: formatter) {
             let comps = calendar.dateComponents([.hour, .minute], from: time)
-            guard let anchored = calendar.date(
-                bySettingHour: comps.hour ?? 0,
-                minute: comps.minute ?? 0,
-                second: 0,
-                of: now) else { return nil }
-            if anchored >= now { return anchored }
-            return calendar.date(byAdding: .day, value: 1, to: anchored)
+            return self.resolveOccurrence(
+                self.dailyOccurrences(for: comps, now: now, calendar: calendar),
+                now: now,
+                expectedWindow: expectedWindow)
         }
 
         guard let time = self.parseDate(raw, formats: Self.resetTimeHourOnly, formatter: formatter) else { return nil }
         let comps = calendar.dateComponents([.hour], from: time)
-        guard let anchored = calendar.date(
-            bySettingHour: comps.hour ?? 0,
-            minute: 0,
-            second: 0,
-            of: now) else { return nil }
-        if anchored >= now { return anchored }
-        return calendar.date(byAdding: .day, value: 1, to: anchored)
+        return self.resolveOccurrence(
+            self.dailyOccurrences(for: comps, now: now, calendar: calendar),
+            now: now,
+            expectedWindow: expectedWindow)
+    }
+
+    private static func explicitOccurrences(for date: Date, calendar: Calendar) -> [Date] {
+        let components = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+        guard let year = components.year,
+              let month = components.month,
+              let day = components.day,
+              let hour = components.hour,
+              let minute = components.minute
+        else { return [] }
+        return self.exactLocalOccurrences(
+            DateComponents(
+                timeZone: calendar.timeZone,
+                year: year,
+                month: month,
+                day: day,
+                hour: hour,
+                minute: minute,
+                second: 0),
+            calendar: calendar)
+    }
+
+    private static func resolveOccurrence(
+        _ candidates: [Date],
+        now: Date,
+        expectedWindow: TimeInterval?) -> Date?
+    {
+        let sortedCandidates = candidates.sorted()
+        guard let future = sortedCandidates.first(where: { $0 >= now }) else { return sortedCandidates.last }
+        guard let expectedWindow else { return future }
+
+        let horizon = max(0, expectedWindow)
+        let past = sortedCandidates.last(where: { $0 < now })
+        let pastIsPlausible = past.map { now.timeIntervalSince($0) <= horizon } ?? false
+        let futureIsPlausible = future.timeIntervalSince(now) <= horizon
+        return pastIsPlausible && !futureIsPlausible ? past : future
+    }
+
+    private static func yearlyOccurrences(
+        for components: DateComponents,
+        now: Date,
+        calendar: Calendar) -> [Date]
+    {
+        guard let month = components.month,
+              let day = components.day,
+              let hour = components.hour
+        else { return [] }
+        let currentYear = calendar.component(.year, from: now)
+        // Eight years covers the Gregorian century gap between leap days (for example, 2096 to 2104).
+        return ((currentYear - 8)...(currentYear + 8)).flatMap { year in
+            self.exactLocalOccurrences(
+                DateComponents(
+                    timeZone: calendar.timeZone,
+                    year: year,
+                    month: month,
+                    day: day,
+                    hour: hour,
+                    minute: components.minute ?? 0,
+                    second: 0),
+                calendar: calendar)
+        }
+    }
+
+    private static func dailyOccurrences(
+        for components: DateComponents,
+        now: Date,
+        calendar: Calendar) -> [Date]
+    {
+        guard let hour = components.hour else { return [] }
+        let startOfToday = calendar.startOfDay(for: now)
+        return (-1...1).flatMap { offset -> [Date] in
+            guard let day = calendar.date(byAdding: .day, value: offset, to: startOfToday) else { return [] }
+            let dayComponents = calendar.dateComponents([.year, .month, .day], from: day)
+            guard let year = dayComponents.year,
+                  let month = dayComponents.month,
+                  let dayOfMonth = dayComponents.day
+            else { return [] }
+            return self.exactLocalOccurrences(
+                DateComponents(
+                    timeZone: calendar.timeZone,
+                    year: year,
+                    month: month,
+                    day: dayOfMonth,
+                    hour: hour,
+                    minute: components.minute ?? 0,
+                    second: 0),
+                calendar: calendar)
+        }
+    }
+
+    /// Returns both instants when a local wall time repeats during a daylight-saving transition.
+    private static func exactLocalOccurrences(
+        _ target: DateComponents,
+        calendar: Calendar) -> [Date]
+    {
+        guard let year = target.year,
+              let month = target.month,
+              let day = target.day,
+              let hour = target.hour,
+              let minute = target.minute
+        else { return [] }
+        guard let firstApproximation = calendar.date(from: target) else { return [] }
+        let approximationComponents = calendar.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second],
+            from: firstApproximation)
+        guard approximationComponents.year == year,
+              approximationComponents.month == month,
+              approximationComponents.day == day,
+              approximationComponents.hour == hour,
+              approximationComponents.minute == minute,
+              approximationComponents.second == 0
+        else { return [] }
+        let startOfDay = calendar.startOfDay(for: firstApproximation)
+        guard let searchStart = calendar.date(byAdding: .second, value: -1, to: startOfDay) else { return [] }
+
+        var results: [Date] = []
+        for policy in [Calendar.RepeatedTimePolicy.first, .last] {
+            guard let date = calendar.nextDate(
+                after: searchStart,
+                matching: target,
+                matchingPolicy: .strict,
+                repeatedTimePolicy: policy,
+                direction: .forward)
+            else { continue }
+            let resolved = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
+            guard resolved.year == year,
+                  resolved.month == month,
+                  resolved.day == day,
+                  resolved.hour == hour,
+                  resolved.minute == minute,
+                  resolved.second == 0,
+                  !results.contains(date)
+            else { continue }
+            results.append(date)
+        }
+        return results
     }
 
     private static let resetTimeWithMinutes = ["h:mma", "h:mm a", "HH:mm", "H:mm"]
     private static let resetTimeHourOnly = ["ha", "h a"]
+
+    private static let resetDateTimeWithExplicitYear = [
+        "MMM d, yyyy, h:mma",
+        "MMM d, yyyy, h:mm a",
+        "MMM d, yyyy, HH:mm",
+        "MMM d, yyyy h:mma",
+        "MMM d, yyyy h:mm a",
+        "MMM d, yyyy HH:mm",
+        "MMM d yyyy h:mma",
+        "MMM d yyyy h:mm a",
+        "MMM d yyyy HH:mm",
+        "MMM d, yyyy, ha",
+        "MMM d, yyyy, h a",
+        "MMM d, yyyy, HH",
+        "MMM d, yyyy ha",
+        "MMM d, yyyy h a",
+        "MMM d, yyyy HH",
+        "MMM d yyyy ha",
+        "MMM d yyyy h a",
+        "MMM d yyyy HH",
+    ]
 
     private static let resetDateTimeWithMinutes = [
         "MMM d, h:mma",
@@ -639,7 +1207,9 @@ public struct ClaudeStatusProbe: Sendable {
     private static func parseDate(_ text: String, formats: [String], formatter: DateFormatter) -> Date? {
         for pattern in formats {
             formatter.dateFormat = pattern
-            if let date = formatter.date(from: text) { return date }
+            if let date = formatter.date(from: text) {
+                return date
+            }
         }
         return nil
     }
@@ -652,7 +1222,10 @@ public struct ClaudeStatusProbe: Sendable {
         }
         // Capture any "Claude <...>" phrase (e.g., Max/Pro/Ultra/Team) to avoid future plan-name churn.
         // Strip any leading ANSI that may have survived (rare) before matching.
-        let planPattern = #"(?i)(claude\s+[a-z0-9][a-z0-9\s._-]{0,24})"#
+        // Use horizontal whitespace ([ \t]) rather than \s so the match stays on a single rendered line:
+        // \s spans newlines, which let "…use Claude" bridge into the /usage panel's "d → today" hint and
+        // produced a bogus "Dtoday" plan label after ANSI stripping glued the lines together.
+        let planPattern = #"(?i)(claude[ \t]+[a-z0-9][a-z0-9 \t._-]{0,24})"#
         var candidates: [String] = []
         if let regex = try? NSRegularExpression(pattern: planPattern, options: []) {
             let nsrange = NSRange(text.startIndex..<text.endIndex, in: text)
@@ -706,7 +1279,9 @@ public struct ClaudeStatusProbe: Sendable {
     @MainActor private static var recentDumps: [String] = []
 
     @MainActor private static func recordDump(_ text: String) {
-        if self.recentDumps.count >= 5 { self.recentDumps.removeFirst() }
+        if self.recentDumps.count >= 5 {
+            self.recentDumps.removeFirst()
+        }
         self.recentDumps.append(text)
     }
 
@@ -758,14 +1333,21 @@ public struct ClaudeStatusProbe: Sendable {
         }
 
         var parts: [String] = []
-        if let message, !message.isEmpty { parts.append(message) }
-        if let code, !code.isEmpty { parts.append("(\(code))") }
+        if let message, !message.isEmpty {
+            parts.append(message)
+        }
+        if let code, !code.isEmpty {
+            parts.append("(\(code))")
+        }
 
         guard !parts.isEmpty else { return nil }
         let hint = parts.joined(separator: " ")
 
         if let code, code.lowercased().contains("token") {
             return "\(hint). Run `claude login` to refresh."
+        }
+        if type == "authentication_error" || type == "permission_error" {
+            return "Claude CLI authentication error: \(hint). Run `claude login`."
         }
         return "Claude CLI error: \(hint)"
     }
@@ -802,15 +1384,48 @@ public struct ClaudeStatusProbe: Sendable {
         }
     }
 
+    static func preparedProbeWorkingDirectoryURL() -> URL {
+        let directory = self.probeWorkingDirectoryURL()
+        do {
+            try self.prepareProbeWorkingDirectory(at: directory)
+        } catch {
+            Self.log.warning(
+                "Claude probe local settings unavailable",
+                metadata: ["error": error.localizedDescription])
+        }
+        return directory
+    }
+
+    static func prepareProbeWorkingDirectory(at directory: URL, fileManager fm: FileManager = .default) throws {
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        let claudeDirectory = directory.appendingPathComponent(".claude", isDirectory: true)
+        try fm.createDirectory(at: claudeDirectory, withIntermediateDirectories: true)
+
+        let settingsURL = claudeDirectory.appendingPathComponent("settings.local.json")
+        var settings = (try? self.readSettingsObject(from: settingsURL, fileManager: fm)) ?? [:]
+        settings["disableDeepLinkRegistration"] = "disable"
+        let data = try JSONSerialization.data(
+            withJSONObject: settings,
+            options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: settingsURL, options: .atomic)
+    }
+
+    private static func readSettingsObject(from url: URL, fileManager fm: FileManager) throws -> [String: Any] {
+        guard fm.fileExists(atPath: url.path) else {
+            return [:]
+        }
+        let data = try Data(contentsOf: url)
+        guard !data.isEmpty else {
+            return [:]
+        }
+        let object = try JSONSerialization.jsonObject(with: data)
+        return object as? [String: Any] ?? [:]
+    }
+
     /// Run claude CLI inside a PTY so we can respond to interactive permission prompts.
     private static func capture(subcommand: String, binary: String, timeout: TimeInterval) async throws -> String {
         let stopOnSubstrings = subcommand == "/usage"
             ? [
-                "Current week (all models)",
-                "Current week (Opus)",
-                "Current week (Sonnet only)",
-                "Current week (Sonnet)",
-                "Current session",
                 "Failed to load usage data",
                 "failed to load usage data",
                 "Failedto loadusagedata",
@@ -819,25 +1434,44 @@ public struct ClaudeStatusProbe: Sendable {
             : []
         let idleTimeout: TimeInterval? = subcommand == "/usage" ? nil : 3.0
         let sendEnterEvery: TimeInterval? = subcommand == "/usage" ? 0.8 : nil
+        let stopWhenNormalized: (@Sendable (String) -> Bool)? = subcommand == "/usage"
+            ? { @Sendable normalizedScan in
+                Self.usageCaptureHasSessionValue(normalizedScan)
+                    || Self.usageCaptureHasSubscriptionNotice(normalizedScan)
+            }
+            : nil
         do {
-            return try await ClaudeCLISession.shared.capture(
+            return try await ClaudeCLISession.current.capture(
                 subcommand: subcommand,
                 binary: binary,
                 timeout: timeout,
                 idleTimeout: idleTimeout,
                 stopOnSubstrings: stopOnSubstrings,
+                stopWhenNormalized: stopWhenNormalized,
                 settleAfterStop: subcommand == "/usage" ? 2.0 : 0.25,
                 sendEnterEvery: sendEnterEvery)
         } catch ClaudeCLISession.SessionError.processExited {
-            await ClaudeCLISession.shared.reset()
+            await ClaudeCLISession.current.reset()
             throw ClaudeStatusProbeError.timedOut
         } catch ClaudeCLISession.SessionError.timedOut {
+            await ClaudeCLISession.current.reset()
             throw ClaudeStatusProbeError.timedOut
         } catch ClaudeCLISession.SessionError.launchFailed(_) {
             throw ClaudeStatusProbeError.claudeNotInstalled
         } catch {
-            await ClaudeCLISession.shared.reset()
+            await ClaudeCLISession.current.reset()
             throw error
         }
+    }
+
+    private static func usageCaptureHasSessionValue(_ normalizedText: String) -> Bool {
+        guard let labelRange = normalizedText.range(of: "currentsession") else { return false }
+        let tail = normalizedText[labelRange.upperBound...]
+        return tail.range(of: #"[0-9]{1,3}(?:\.[0-9]+)?%"#, options: .regularExpression) != nil
+    }
+
+    private static func usageCaptureHasSubscriptionNotice(_ normalizedText: String) -> Bool {
+        normalizedText.contains("currentlyusingyoursubscription")
+            && normalizedText.contains("claudecodeusage")
     }
 }

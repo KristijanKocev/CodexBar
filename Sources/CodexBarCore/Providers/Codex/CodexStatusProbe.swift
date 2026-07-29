@@ -8,6 +8,7 @@ public struct CodexStatusSnapshot: Sendable {
     public let weeklyResetDescription: String?
     public let fiveHourResetsAt: Date?
     public let weeklyResetsAt: Date?
+    public let codexCreditLimit: CodexCreditLimitSnapshot?
     public let rawText: String
 
     public init(
@@ -18,6 +19,7 @@ public struct CodexStatusSnapshot: Sendable {
         weeklyResetDescription: String?,
         fiveHourResetsAt: Date?,
         weeklyResetsAt: Date?,
+        codexCreditLimit: CodexCreditLimitSnapshot? = nil,
         rawText: String)
     {
         self.credits = credits
@@ -27,12 +29,14 @@ public struct CodexStatusSnapshot: Sendable {
         self.weeklyResetDescription = weeklyResetDescription
         self.fiveHourResetsAt = fiveHourResetsAt
         self.weeklyResetsAt = weeklyResetsAt
+        self.codexCreditLimit = codexCreditLimit
         self.rawText = rawText
     }
 }
 
 public enum CodexStatusProbeError: LocalizedError, Sendable {
     case codexNotInstalled
+    case launchBlocked(String)
     case parseFailed(String)
     case timedOut
     case updateRequired(String)
@@ -41,6 +45,8 @@ public enum CodexStatusProbeError: LocalizedError, Sendable {
         switch self {
         case .codexNotInstalled:
             "Codex CLI missing. Install via `npm i -g @openai/codex` (or bun install) and restart."
+        case let .launchBlocked(message):
+            message
         case .parseFailed:
             "Could not parse Codex status; will retry shortly."
         case .timedOut:
@@ -82,6 +88,9 @@ public struct CodexStatusProbe {
         guard FileManager.default.isExecutableFile(atPath: resolved) || TTYCommandRunner.which(resolved) != nil else {
             throw CodexStatusProbeError.codexNotInstalled
         }
+        if let message = CodexCLILaunchGate.shared.backgroundSkipMessage(binary: resolved) {
+            throw CodexStatusProbeError.launchBlocked(message)
+        }
         do {
             return try await self.runAndParse(binary: resolved, rows: 60, cols: 200, timeout: self.timeout)
         } catch let error as CodexStatusProbeError {
@@ -121,7 +130,8 @@ public struct CodexStatusProbe {
         let weekPct = weekLine.flatMap(TextParsing.percentLeft(fromLine:))
         let fiveReset = fiveLine.flatMap(TextParsing.resetString(fromLine:))
         let weekReset = weekLine.flatMap(TextParsing.resetString(fromLine:))
-        if credits == nil, fivePct == nil, weekPct == nil {
+        let monthlyLimit = self.parseMonthlyCreditLimit(text: clean, now: now)
+        if credits == nil, fivePct == nil, weekPct == nil, monthlyLimit == nil {
             throw CodexStatusProbeError.parseFailed(clean.prefix(400).description)
         }
         return CodexStatusSnapshot(
@@ -132,7 +142,34 @@ public struct CodexStatusProbe {
             weeklyResetDescription: weekReset,
             fiveHourResetsAt: self.parseResetDate(from: fiveReset, now: now),
             weeklyResetsAt: self.parseResetDate(from: weekReset, now: now),
+            codexCreditLimit: monthlyLimit,
             rawText: clean)
+    }
+
+    private static func parseMonthlyCreditLimit(text: String, now: Date) -> CodexCreditLimitSnapshot? {
+        guard let monthlyLine = TextParsing.firstLine(matching: #"Monthly credit limit[^\n]*"#, text: text) else {
+            return nil
+        }
+        guard let limit = TextParsing.firstNumber(
+            pattern: #"of\s+([0-9][0-9., ]*)\s+credits used"#,
+            text: text),
+            limit > 0
+        else {
+            return nil
+        }
+        let used = TextParsing.firstNumber(
+            pattern: #"([0-9][0-9., ]*)\s+of\s+[0-9][0-9., ]*\s+credits used"#,
+            text: text) ?? 0
+        let remainingPercent = TextParsing.percentLeft(fromLine: monthlyLine)
+            .map(Double.init)
+            ?? max(0, min(100, 100 - (used / limit * 100)))
+        let resetText = TextParsing.resetString(fromLine: monthlyLine)
+        return CodexCreditLimitSnapshot(
+            used: used,
+            limit: limit,
+            remainingPercent: remainingPercent,
+            resetsAt: self.parseResetDate(from: resetText, now: now),
+            updatedAt: now)
     }
 
     private static func parseResetDate(from text: String?, now: Date) -> Date? {
@@ -198,35 +235,53 @@ public struct CodexStatusProbe {
         cols: UInt16,
         timeout: TimeInterval) async throws -> CodexStatusSnapshot
     {
+        let stateHome = try CodexStatusProbeIsolation.supportDirectory(environment: self.environment)
+        let extraArgs = CodexStatusProbeIsolation.codexArguments(stateHome: stateHome)
+        let workingDirectory = CodexStatusProbeIsolation.workingDirectory(environment: self.environment)
         let text: String
         if self.keepCLISessionsAlive {
             do {
                 text = try await CodexCLISession.shared.captureStatus(
                     binary: binary,
-                    timeout: timeout,
-                    rows: rows,
-                    cols: cols,
-                    environment: self.environment)
+                    options: .init(
+                        timeout: timeout,
+                        rows: rows,
+                        cols: cols,
+                        environment: self.environment,
+                        extraArgs: extraArgs,
+                        workingDirectory: workingDirectory))
             } catch CodexCLISession.SessionError.processExited {
                 throw CodexStatusProbeError.timedOut
             } catch CodexCLISession.SessionError.timedOut {
                 throw CodexStatusProbeError.timedOut
-            } catch CodexCLISession.SessionError.launchFailed(_) {
+            } catch let CodexCLISession.SessionError.launchFailed(message) {
+                if let throttled = CodexCLILaunchGate.shared.recordLaunchFailure(binary: binary, message: message) {
+                    throw CodexStatusProbeError.launchBlocked(throttled)
+                }
                 throw CodexStatusProbeError.codexNotInstalled
             }
         } else {
             let runner = TTYCommandRunner()
             let script = "/status"
-            let result = try runner.run(
-                binary: binary,
-                send: script,
-                options: .init(
-                    rows: rows,
-                    cols: cols,
-                    timeout: timeout,
-                    extraArgs: ["-s", "read-only", "-a", "untrusted"],
-                    baseEnvironment: self.environment,
-                    forceCodexStatusMode: true))
+            let result: TTYCommandRunner.Result
+            do {
+                result = try runner.run(
+                    binary: binary,
+                    send: script,
+                    options: .init(
+                        rows: rows,
+                        cols: cols,
+                        timeout: timeout,
+                        workingDirectory: workingDirectory,
+                        extraArgs: extraArgs,
+                        baseEnvironment: self.environment,
+                        forceCodexStatusMode: true))
+            } catch let TTYCommandRunner.Error.launchFailed(message) {
+                if let throttled = CodexCLILaunchGate.shared.recordLaunchFailure(binary: binary, message: message) {
+                    throw CodexStatusProbeError.launchBlocked(throttled)
+                }
+                throw CodexStatusProbeError.codexNotInstalled
+            }
             text = result.text
         }
         return try Self.parse(text: text)

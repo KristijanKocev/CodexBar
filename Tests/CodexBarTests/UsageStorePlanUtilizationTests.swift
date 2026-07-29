@@ -144,6 +144,32 @@ struct UsageStorePlanUtilizationTests {
 
     @MainActor
     @Test
+    func `native chart folds near canonical codex windows into single tabs`() {
+        let histories = [
+            planSeries(name: .session, windowMinutes: 299, entries: [
+                planEntry(at: Date(timeIntervalSince1970: 1_700_000_000), usedPercent: 20),
+            ]),
+            planSeries(name: .session, windowMinutes: 300, entries: [
+                planEntry(at: Date(timeIntervalSince1970: 1_700_003_600), usedPercent: 30),
+            ]),
+            planSeries(name: .weekly, windowMinutes: 10079, entries: [
+                planEntry(at: Date(timeIntervalSince1970: 1_700_086_400), usedPercent: 40),
+            ]),
+            planSeries(name: .weekly, windowMinutes: 10080, entries: [
+                planEntry(at: Date(timeIntervalSince1970: 1_700_172_800), usedPercent: 50),
+            ]),
+        ]
+
+        let model = PlanUtilizationHistoryChartMenuView._modelSnapshotForTesting(
+            histories: histories,
+            provider: .codex)
+
+        #expect(model.visibleSeries == ["session:300", "weekly:10080"])
+        #expect(model.selectedSeries == "session:300")
+    }
+
+    @MainActor
+    @Test
     func `claude history tabs match current snapshot bars`() {
         let histories = [
             planSeries(name: .session, windowMinutes: 300, entries: [
@@ -169,6 +195,36 @@ struct UsageStorePlanUtilizationTests {
             snapshot: snapshot)
 
         #expect(model.visibleSeries == ["session:300", "weekly:10080"])
+        #expect(model.selectedSeries == "session:300")
+    }
+
+    @MainActor
+    @Test
+    func `opencodego history tabs include the monthly series`() {
+        let histories = [
+            planSeries(name: .session, windowMinutes: 300, entries: [
+                planEntry(at: Date(timeIntervalSince1970: 1_700_000_000), usedPercent: 12),
+            ]),
+            planSeries(name: .weekly, windowMinutes: 10080, entries: [
+                planEntry(at: Date(timeIntervalSince1970: 1_700_086_400), usedPercent: 57),
+            ]),
+            planSeries(name: .monthly, windowMinutes: 43200, entries: [
+                planEntry(at: Date(timeIntervalSince1970: 1_700_086_400), usedPercent: 34),
+            ]),
+        ]
+        let snapshot = UsageSnapshot(
+            primary: RateWindow(usedPercent: 12, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
+            secondary: RateWindow(usedPercent: 57, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
+            tertiary: RateWindow(usedPercent: 34, windowMinutes: 43200, resetsAt: nil, resetDescription: nil),
+            updatedAt: Date(timeIntervalSince1970: 1_700_086_400),
+            identity: nil)
+
+        let model = PlanUtilizationHistoryChartMenuView._modelSnapshotForTesting(
+            histories: histories,
+            provider: .opencodego,
+            snapshot: snapshot)
+
+        #expect(model.visibleSeries == ["session:300", "weekly:10080", "monthly:43200"])
         #expect(model.selectedSeries == "session:300")
     }
 
@@ -398,6 +454,16 @@ struct UsageStorePlanUtilizationTests {
     @MainActor
     @Test
     func `detail line uses lowercase am pm for session hover`() {
+        let previousLanguage = UserDefaults.standard.object(forKey: "appLanguage")
+        UserDefaults.standard.set("en", forKey: "appLanguage")
+        defer {
+            if let previousLanguage {
+                UserDefaults.standard.set(previousLanguage, forKey: "appLanguage")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "appLanguage")
+            }
+        }
+
         let boundary = Date(timeIntervalSince1970: 1_710_048_000) // Mar 11, 2024 1:20 pm UTC
         let histories = [
             planSeries(name: .session, windowMinutes: 300, entries: [
@@ -419,6 +485,16 @@ struct UsageStorePlanUtilizationTests {
     @MainActor
     @Test
     func `detail line uses lowercase am pm for weekly hover`() {
+        let previousLanguage = UserDefaults.standard.object(forKey: "appLanguage")
+        UserDefaults.standard.set("en", forKey: "appLanguage")
+        defer {
+            if let previousLanguage {
+                UserDefaults.standard.set(previousLanguage, forKey: "appLanguage")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "appLanguage")
+            }
+        }
+
         let boundary = Date(timeIntervalSince1970: 1_710_048_000) // Mar 11, 2024 1:20 pm UTC
         let histories = [
             planSeries(name: .weekly, windowMinutes: 10080, entries: [
@@ -491,6 +567,44 @@ struct UsageStorePlanUtilizationTests {
         let bobHistory = store.planUtilizationHistory(for: .codex)
         #expect(store.planUtilizationHistory[.codex]?.preferredAccountKey == bobKey)
         #expect(bobHistory == [bobWeekly])
+    }
+
+    @MainActor
+    @Test
+    func `cursor automatic history ignores dormant saved token account`() async throws {
+        let store = Self.makeStore()
+        store.settings.historicalTrackingEnabled = true
+        store.settings.addTokenAccount(
+            provider: .cursor,
+            label: "Dormant manual account",
+            token: "fixture")
+        let dormantAccount = try #require(store.settings.selectedTokenAccount(for: .cursor))
+        let dormantAccountKey = try #require(
+            UsageStore._planUtilizationTokenAccountKeyForTesting(
+                provider: .cursor,
+                account: dormantAccount))
+        store.settings.cursorCookieSource = .auto
+
+        let browserSnapshot = Self.makeSnapshot(provider: .cursor, email: "browser@example.com")
+        let browserAccountKey = try #require(
+            UsageStore._planUtilizationAccountKeyForTesting(
+                provider: .cursor,
+                snapshot: browserSnapshot))
+        store._setSnapshotForTesting(browserSnapshot, provider: .cursor)
+
+        await store.recordPlanUtilizationHistorySample(
+            provider: .cursor,
+            snapshot: browserSnapshot,
+            now: Date(timeIntervalSince1970: 1_700_000_000))
+
+        let histories = store.planUtilizationHistory(for: .cursor)
+        let buckets = try #require(store.planUtilizationHistory[.cursor])
+        #expect(store.settings.selectedTokenAccount(for: .cursor)?.id == dormantAccount.id)
+        #expect(store.settings.effectiveSelectedTokenAccount(for: .cursor) == nil)
+        #expect(buckets.preferredAccountKey == browserAccountKey)
+        #expect(buckets.accounts[dormantAccountKey] == nil)
+        #expect(histories == buckets.accounts[browserAccountKey])
+        #expect(!histories.isEmpty)
     }
 
     @MainActor
@@ -690,176 +804,60 @@ struct UsageStorePlanUtilizationTests {
 
     @MainActor
     @Test
-    func `weekly quota celebration posts when weekly usage resets to zero`() async {
+    func `opencodego plan history is always supported like codex and claude`() {
         let store = Self.makeStore()
-        let accountLabel = "reset-zero@example.com"
-        let recorder = WeeklyLimitResetEventRecorder(provider: .claude, accountLabel: accountLabel)
-        defer { recorder.invalidate() }
-
-        let before = UsageSnapshot(
-            primary: RateWindow(usedPercent: 10, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
-            secondary: RateWindow(usedPercent: 99, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
-            updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
-            identity: ProviderIdentitySnapshot(
-                providerID: .claude,
-                accountEmail: accountLabel,
-                accountOrganization: nil,
-                loginMethod: "max"))
-        let after = UsageSnapshot(
-            primary: RateWindow(usedPercent: 10, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
-            secondary: RateWindow(usedPercent: 0, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
-            updatedAt: Date(timeIntervalSince1970: 1_700_003_600),
-            identity: ProviderIdentitySnapshot(
-                providerID: .claude,
-                accountEmail: accountLabel,
-                accountOrganization: nil,
-                loginMethod: "max"))
-
-        await store.recordPlanUtilizationHistorySample(provider: .claude, snapshot: before, now: before.updatedAt)
-        await store.recordPlanUtilizationHistorySample(provider: .claude, snapshot: after, now: after.updatedAt)
-
-        let events = recorder.events
-        #expect(events.count == 1)
-        #expect(events[0].provider == .claude)
-        #expect(events[0].accountLabel == accountLabel)
-        #expect(events[0].usedPercent == 0)
+        #expect(store.settings.historicalTrackingEnabled == false)
+        #expect(store.supportsPlanUtilizationHistory(for: .opencodego))
     }
 
     @MainActor
     @Test
-    func `weekly quota celebration posts when reset lands mid hour without history split`() async {
+    func `record plan history stores opencodego monthly series`() async {
         let store = Self.makeStore()
-        let accountLabel = "mid-hour-reset@example.com"
-        let recorder = WeeklyLimitResetEventRecorder(provider: .claude, accountLabel: accountLabel)
-        defer { recorder.invalidate() }
-
-        let before = UsageSnapshot(
-            primary: RateWindow(usedPercent: 10, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
-            secondary: RateWindow(
-                usedPercent: 40,
-                windowMinutes: 10080,
-                resetsAt: Date(timeIntervalSince1970: 1_700_100_000),
-                resetDescription: nil),
-            updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
-            identity: ProviderIdentitySnapshot(
-                providerID: .claude,
-                accountEmail: accountLabel,
-                accountOrganization: nil,
-                loginMethod: "max"))
-        let after = UsageSnapshot(
-            primary: RateWindow(usedPercent: 10, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
-            secondary: RateWindow(
-                usedPercent: 0,
-                windowMinutes: 10080,
-                resetsAt: Date(timeIntervalSince1970: 1_700_100_030),
-                resetDescription: nil),
-            updatedAt: Date(timeIntervalSince1970: 1_700_001_800),
-            identity: ProviderIdentitySnapshot(
-                providerID: .claude,
-                accountEmail: accountLabel,
-                accountOrganization: nil,
-                loginMethod: "max"))
-
-        await store.recordPlanUtilizationHistorySample(provider: .claude, snapshot: before, now: before.updatedAt)
-        await store.recordPlanUtilizationHistorySample(provider: .claude, snapshot: after, now: after.updatedAt)
-
-        let histories = store.planUtilizationHistory(for: .claude)
-        #expect(findSeries(histories, name: .weekly, windowMinutes: 10080)?.entries.count == 1)
-        #expect(findSeries(histories, name: .weekly, windowMinutes: 10080)?.entries.last?.usedPercent == 40)
-        let events = recorder.events
-        #expect(events.count == 1)
-        #expect(events[0].usedPercent == 0)
-    }
-
-    @MainActor
-    @Test
-    func `weekly quota celebration ignores first seen reset sample`() async {
-        let store = Self.makeStore()
-        let accountLabel = "first-seen-reset@example.com"
-        let recorder = WeeklyLimitResetEventRecorder(provider: .claude, accountLabel: accountLabel)
-        defer { recorder.invalidate() }
-
+        // historicalTrackingEnabled defaults to false; opencodego must still record, like codex/claude.
         let snapshot = UsageSnapshot(
-            primary: RateWindow(usedPercent: 10, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
-            secondary: RateWindow(usedPercent: 0, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
-            updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            primary: RateWindow(usedPercent: 12, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
+            secondary: RateWindow(usedPercent: 57, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
+            tertiary: RateWindow(usedPercent: 34, windowMinutes: 43200, resetsAt: nil, resetDescription: nil),
+            updatedAt: Date(),
             identity: ProviderIdentitySnapshot(
-                providerID: .claude,
-                accountEmail: accountLabel,
+                providerID: .opencodego,
+                accountEmail: nil,
                 accountOrganization: nil,
-                loginMethod: "max"))
+                loginMethod: nil))
+        store._setSnapshotForTesting(snapshot, provider: .opencodego)
 
-        await store.recordPlanUtilizationHistorySample(provider: .claude, snapshot: snapshot, now: snapshot.updatedAt)
+        await store.recordPlanUtilizationHistorySample(
+            provider: .opencodego,
+            snapshot: snapshot,
+            now: Date(timeIntervalSince1970: 1_700_000_000))
 
-        #expect(recorder.events.isEmpty)
+        let histories = store.planUtilizationHistory(for: .opencodego)
+        #expect(findSeries(histories, name: .session, windowMinutes: 300)?.entries.last?.usedPercent == 12)
+        #expect(findSeries(histories, name: .weekly, windowMinutes: 10080)?.entries.last?.usedPercent == 57)
+        #expect(findSeries(histories, name: .monthly, windowMinutes: 43200)?.entries.last?.usedPercent == 34)
     }
 
     @MainActor
     @Test
-    func `weekly quota celebration fires once across repeated low samples`() async {
+    func `generic provider weekly lane is persisted to provider history json`() async throws {
         let store = Self.makeStore()
-        let accountLabel = "repeated-low@example.com"
-        let recorder = WeeklyLimitResetEventRecorder(provider: .claude, accountLabel: accountLabel)
-        defer { recorder.invalidate() }
-
+        store.settings.historicalTrackingEnabled = true
+        let accountLabel = "zai-history-org"
+        let firstDate = Date(timeIntervalSince1970: 1_700_000_000)
         let before = UsageSnapshot(
-            primary: RateWindow(usedPercent: 10, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
-            secondary: RateWindow(usedPercent: 60, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
-            updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
-            identity: ProviderIdentitySnapshot(
-                providerID: .claude,
-                accountEmail: accountLabel,
-                accountOrganization: nil,
-                loginMethod: "max"))
-        let firstLow = UsageSnapshot(
-            primary: RateWindow(usedPercent: 10, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
-            secondary: RateWindow(usedPercent: 1, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
-            updatedAt: Date(timeIntervalSince1970: 1_700_001_800),
-            identity: ProviderIdentitySnapshot(
-                providerID: .claude,
-                accountEmail: accountLabel,
-                accountOrganization: nil,
-                loginMethod: "max"))
-        let secondLow = UsageSnapshot(
-            primary: RateWindow(usedPercent: 10, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
-            secondary: RateWindow(usedPercent: 0, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
-            updatedAt: Date(timeIntervalSince1970: 1_700_002_100),
-            identity: ProviderIdentitySnapshot(
-                providerID: .claude,
-                accountEmail: accountLabel,
-                accountOrganization: nil,
-                loginMethod: "max"))
-
-        await store.recordPlanUtilizationHistorySample(provider: .claude, snapshot: before, now: before.updatedAt)
-        await store.recordPlanUtilizationHistorySample(provider: .claude, snapshot: firstLow, now: firstLow.updatedAt)
-        await store.recordPlanUtilizationHistorySample(provider: .claude, snapshot: secondLow, now: secondLow.updatedAt)
-
-        let events = recorder.events
-        #expect(events.count == 1)
-        #expect(events[0].usedPercent == 1)
-    }
-
-    @MainActor
-    @Test
-    func `weekly quota celebration posts for generic provider weekly lane`() async {
-        let store = Self.makeStore()
-        let accountLabel = "zai-reset-org"
-        let recorder = WeeklyLimitResetEventRecorder(provider: .zai, accountLabel: accountLabel)
-        defer { recorder.invalidate() }
-
-        let before = UsageSnapshot(
-            primary: RateWindow(usedPercent: 92, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
+            primary: RateWindow(usedPercent: 42, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
             secondary: RateWindow(usedPercent: 15, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
-            updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            updatedAt: firstDate,
             identity: ProviderIdentitySnapshot(
                 providerID: .zai,
                 accountEmail: nil,
                 accountOrganization: accountLabel,
                 loginMethod: "pro"))
         let after = UsageSnapshot(
-            primary: RateWindow(usedPercent: 0, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
-            secondary: RateWindow(usedPercent: 15, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
-            updatedAt: Date(timeIntervalSince1970: 1_700_003_600),
+            primary: RateWindow(usedPercent: 58, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
+            secondary: RateWindow(usedPercent: 25, windowMinutes: 300, resetsAt: nil, resetDescription: nil),
+            updatedAt: firstDate.addingTimeInterval(3600),
             identity: ProviderIdentitySnapshot(
                 providerID: .zai,
                 accountEmail: nil,
@@ -869,11 +867,152 @@ struct UsageStorePlanUtilizationTests {
         await store.recordPlanUtilizationHistorySample(provider: .zai, snapshot: before, now: before.updatedAt)
         await store.recordPlanUtilizationHistorySample(provider: .zai, snapshot: after, now: after.updatedAt)
 
-        let events = recorder.events
-        #expect(events.count == 1)
-        #expect(events[0].provider == .zai)
-        #expect(events[0].accountLabel == accountLabel)
-        #expect(events[0].usedPercent == 0)
+        let histories = store.planUtilizationHistory(for: .zai)
+        #expect(findSeries(histories, name: .weekly, windowMinutes: 10080)?.entries.map(\.usedPercent) == [42, 58])
+        #expect(findSeries(histories, name: .session, windowMinutes: 300)?.entries.map(\.usedPercent) == [15, 25])
+
+        let providerURL = try #require(store.planUtilizationHistoryStore.directoryURL?
+            .appendingPathComponent("zai.json", isDirectory: false))
+        var persistedBuckets: PlanUtilizationHistoryBuckets?
+        for _ in 0..<20 {
+            persistedBuckets = store.planUtilizationHistoryStore.load()[.zai]
+            let weeklyEntries = persistedBuckets?.histories(for: persistedBuckets?.preferredAccountKey)
+                .first { $0.name == .weekly }?.entries.count
+            if weeklyEntries == 2 {
+                break
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(FileManager.default.fileExists(atPath: providerURL.path))
+        let persisted = try #require(persistedBuckets)
+        #expect(persisted.histories(for: persisted.preferredAccountKey)
+            .first { $0.name == .weekly }?.entries.map(\.usedPercent) == [42, 58])
+    }
+
+    @MainActor
+    @Test
+    func `generic history opt in controls recording while saved history stays visible`() async throws {
+        let store = Self.makeStore()
+        let firstDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let before = UsageSnapshot(
+            primary: RateWindow(usedPercent: 42, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
+            secondary: nil,
+            updatedAt: firstDate)
+        store._setSnapshotForTesting(before, provider: .zai)
+        let providerURL = try #require(store.planUtilizationHistoryStore.directoryURL?
+            .appendingPathComponent("zai.json", isDirectory: false))
+
+        #expect(store.settings.historicalTrackingEnabled == false)
+        #expect(store.supportsPlanUtilizationHistory(for: .zai) == false)
+        await store.recordPlanUtilizationHistorySample(provider: .zai, snapshot: before, now: before.updatedAt)
+        #expect(store.planUtilizationHistory(for: .zai).isEmpty)
+        #expect(FileManager.default.fileExists(atPath: providerURL.path) == false)
+
+        store.settings.historicalTrackingEnabled = true
+        #expect(store.supportsPlanUtilizationHistory(for: .zai))
+        await store.recordPlanUtilizationHistorySample(provider: .zai, snapshot: before, now: before.updatedAt)
+        #expect(findSeries(store.planUtilizationHistory(for: .zai), name: .weekly, windowMinutes: 10080)?
+            .entries.map(\.usedPercent) == [42])
+
+        store.settings.historicalTrackingEnabled = false
+        #expect(store.supportsPlanUtilizationHistory(for: .zai))
+        let after = UsageSnapshot(
+            primary: RateWindow(usedPercent: 58, windowMinutes: 10080, resetsAt: nil, resetDescription: nil),
+            secondary: nil,
+            updatedAt: firstDate.addingTimeInterval(3600))
+        await store.recordPlanUtilizationHistorySample(provider: .zai, snapshot: after, now: after.updatedAt)
+        #expect(findSeries(store.planUtilizationHistory(for: .zai), name: .weekly, windowMinutes: 10080)?
+            .entries.map(\.usedPercent) == [42])
+
+        for _ in 0..<20 where !FileManager.default.fileExists(atPath: providerURL.path) {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(FileManager.default.fileExists(atPath: providerURL.path))
+    }
+
+    @MainActor
+    @Test
+    func `generic provider persists weekly extra window`() async {
+        let store = Self.makeStore()
+        store.settings.historicalTrackingEnabled = true
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let snapshot = UsageSnapshot(
+            primary: nil,
+            secondary: nil,
+            extraRateWindows: [
+                NamedRateWindow(
+                    id: "weekly-budget",
+                    title: "Weekly budget",
+                    window: RateWindow(
+                        usedPercent: 42,
+                        windowMinutes: 10080,
+                        resetsAt: nil,
+                        resetDescription: nil)),
+            ],
+            updatedAt: now)
+
+        await store.recordPlanUtilizationHistorySample(provider: .zai, snapshot: snapshot, now: now)
+
+        #expect(findSeries(store.planUtilizationHistory(for: .zai), name: .weekly, windowMinutes: 10080)?
+            .entries.map(\.usedPercent) == [42])
+    }
+
+    @MainActor
+    @Test
+    func `generic provider ignores unknown weekly extra window`() async {
+        let store = Self.makeStore()
+        store.settings.historicalTrackingEnabled = true
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let snapshot = UsageSnapshot(
+            primary: nil,
+            secondary: nil,
+            extraRateWindows: [
+                NamedRateWindow(
+                    id: "weekly-reset-only",
+                    title: "Weekly reset",
+                    window: RateWindow(
+                        usedPercent: 0,
+                        windowMinutes: 10080,
+                        resetsAt: now.addingTimeInterval(3600),
+                        resetDescription: nil),
+                    usageKnown: false),
+            ],
+            updatedAt: now)
+
+        await store.recordPlanUtilizationHistorySample(provider: .zed, snapshot: snapshot, now: now)
+
+        #expect(store.planUtilizationHistory(for: .zed).isEmpty)
+    }
+
+    @MainActor
+    @Test
+    func `generic provider prefers standard weekly window over extra window`() async {
+        let store = Self.makeStore()
+        store.settings.historicalTrackingEnabled = true
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let snapshot = UsageSnapshot(
+            primary: nil,
+            secondary: RateWindow(
+                usedPercent: 42,
+                windowMinutes: 10080,
+                resetsAt: nil,
+                resetDescription: nil),
+            extraRateWindows: [
+                NamedRateWindow(
+                    id: "extra-weekly-budget",
+                    title: "Extra weekly budget",
+                    window: RateWindow(
+                        usedPercent: 84,
+                        windowMinutes: 10080,
+                        resetsAt: nil,
+                        resetDescription: nil)),
+            ],
+            updatedAt: now)
+
+        await store.recordPlanUtilizationHistorySample(provider: .factory, snapshot: snapshot, now: now)
+
+        #expect(findSeries(store.planUtilizationHistory(for: .factory), name: .weekly, windowMinutes: 10080)?
+            .entries.map(\.usedPercent) == [42])
     }
 
     @MainActor
@@ -1003,7 +1142,7 @@ struct UsageStorePlanUtilizationTests {
             .appendingPathComponent("com.steipete.codexbar", isDirectory: true)
             .appendingPathComponent("history", isDirectory: true)
         let store = PlanUtilizationHistoryStore(directoryURL: directoryURL)
-        let buckets = PlanUtilizationHistoryBuckets(
+        var buckets = PlanUtilizationHistoryBuckets(
             preferredAccountKey: "alice",
             unscoped: [
                 planSeries(name: .session, windowMinutes: 300, entries: [
@@ -1020,11 +1159,28 @@ struct UsageStorePlanUtilizationTests {
                     ]),
                 ],
             ])
+        buckets.setSessionEquivalentWindowPairIdentity("session:standard|weekly:standard", for: "alice")
 
         store.save([.codex: buckets])
         let loaded = store.load()
 
         #expect(loaded == [.codex: buckets])
+    }
+
+    @Test
+    func `store persists an invalidated pair identity without histories`() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directoryURL = root
+            .appendingPathComponent("com.steipete.codexbar", isDirectory: true)
+            .appendingPathComponent("history", isDirectory: true)
+        let store = PlanUtilizationHistoryStore(directoryURL: directoryURL)
+        var buckets = PlanUtilizationHistoryBuckets()
+        buckets.invalidateSessionEquivalentWindowPairIdentity(for: nil)
+
+        store.save([.zai: buckets])
+
+        #expect(store.load() == [.zai: buckets])
     }
 }
 
@@ -1080,6 +1236,10 @@ extension UsageStorePlanUtilizationTests {
             startupBehavior: .testing)
         isolatedSettings._test_managedCodexAccountStoreURL = managedStoreURL
         isolatedSettings.codexActiveSource = .liveSystem
+        // Cancel the background plan-utilization decode so it cannot race the
+        // explicit empty assignment below. Production paths still load on the
+        // utility queue; this only short-circuits the test setup.
+        store._cancelPlanUtilizationHistoryLoadForTesting()
         store.planUtilizationHistory = [:]
         return store
     }
@@ -1112,6 +1272,29 @@ extension UsageStorePlanUtilizationTests {
     }
 }
 
+extension UsageStorePlanUtilizationTests {
+    @MainActor
+    @Test
+    func `global refresh tail does not keep completed provider plan card loading`() {
+        let store = Self.makeStore()
+        store._setSnapshotForTesting(nil, provider: .claude)
+        store.isRefreshing = true
+        store.refreshingProviders.insert(.claude)
+
+        #expect(store.shouldShowRefreshingMenuCard(for: .claude))
+        #expect(store.shouldShowRefreshingMenuCardIndicator(for: .claude))
+        #expect(store.shouldHidePlanUtilizationMenuItem(for: .claude))
+
+        store.refreshingProviders.remove(.claude)
+
+        #expect(store.isRefreshing)
+        #expect(store.refreshingProviders.isEmpty)
+        #expect(!store.shouldShowRefreshingMenuCard(for: .claude))
+        #expect(!store.shouldShowRefreshingMenuCardIndicator(for: .claude))
+        #expect(!store.shouldHidePlanUtilizationMenuItem(for: .claude))
+    }
+}
+
 func planEntry(at capturedAt: Date, usedPercent: Double, resetsAt: Date? = nil) -> PlanUtilizationHistoryEntry {
     PlanUtilizationHistoryEntry(capturedAt: capturedAt, usedPercent: usedPercent, resetsAt: resetsAt)
 }
@@ -1130,75 +1313,6 @@ func findSeries(
     windowMinutes: Int) -> PlanUtilizationSeriesHistory?
 {
     histories.first { $0.name == name && $0.windowMinutes == windowMinutes }
-}
-
-private final class WeeklyLimitResetEventRecorder: @unchecked Sendable {
-    struct Event {
-        let provider: UsageProvider
-        let accountLabel: String?
-        let usedPercent: Double
-    }
-
-    private let provider: UsageProvider
-    private let accountLabel: String?
-    private let lock = NSLock()
-    private var observedEvents: [Event] = []
-    private var token: NSObjectProtocol?
-
-    init(provider: UsageProvider, accountLabel: String?) {
-        self.provider = provider
-        self.accountLabel = accountLabel
-        self.token = NotificationCenter.default.addObserver(
-            forName: .codexbarWeeklyLimitReset,
-            object: nil,
-            queue: nil)
-        { [weak self] notification in
-            guard let self,
-                  let event = notification.object as? WeeklyLimitResetEvent
-            else {
-                return
-            }
-
-            let recorded = MainActor.assumeIsolated { () -> Event? in
-                guard event.provider == self.provider,
-                      event.accountLabel == self.accountLabel
-                else {
-                    return nil
-                }
-                return Event(
-                    provider: event.provider,
-                    accountLabel: event.accountLabel,
-                    usedPercent: event.usedPercent)
-            }
-            guard let recorded else { return }
-
-            self.lock.lock()
-            self.observedEvents.append(recorded)
-            self.lock.unlock()
-        }
-    }
-
-    var events: [Event] {
-        self.lock.lock()
-        defer { self.lock.unlock() }
-        return self.observedEvents
-    }
-
-    var count: Int {
-        self.lock.lock()
-        defer { self.lock.unlock() }
-        return self.observedEvents.count
-    }
-
-    func invalidate() {
-        guard let token else { return }
-        NotificationCenter.default.removeObserver(token)
-        self.token = nil
-    }
-
-    deinit {
-        self.invalidate()
-    }
 }
 
 func formattedBoundary(_ date: Date) -> String {

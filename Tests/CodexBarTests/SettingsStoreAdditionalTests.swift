@@ -6,6 +6,55 @@ import Testing
 @MainActor
 struct SettingsStoreAdditionalTests {
     @Test
+    @MainActor
+    func `antigravity two pool migration preserves released metric meaning`() {
+        let primaryDefaults = UserDefaults(suiteName: #function + ".primary")!
+        primaryDefaults.removePersistentDomain(forName: #function + ".primary")
+        primaryDefaults.set(
+            [UsageProvider.antigravity.rawValue: MenuBarMetricPreference.primary.rawValue],
+            forKey: "menuBarMetricPreferences")
+
+        let primarySettings = SettingsStore(userDefaults: primaryDefaults)
+
+        #expect(primarySettings.menuBarMetricPreference(for: .antigravity) == .secondary)
+        #expect(primaryDefaults.bool(forKey: "antigravityTwoPoolMetricPreferenceMigrated"))
+
+        let secondaryDefaults = UserDefaults(suiteName: #function + ".secondary")!
+        secondaryDefaults.removePersistentDomain(forName: #function + ".secondary")
+        secondaryDefaults.set(
+            [UsageProvider.antigravity.rawValue: MenuBarMetricPreference.secondary.rawValue],
+            forKey: "menuBarMetricPreferences")
+
+        let secondarySettings = SettingsStore(userDefaults: secondaryDefaults)
+
+        #expect(secondarySettings.menuBarMetricPreference(for: .antigravity) == .primary)
+
+        let reloadedSettings = SettingsStore(userDefaults: secondaryDefaults)
+        #expect(reloadedSettings.menuBarMetricPreference(for: .antigravity) == .primary)
+
+        let tertiaryDefaults = UserDefaults(suiteName: #function + ".tertiary")!
+        tertiaryDefaults.removePersistentDomain(forName: #function + ".tertiary")
+        tertiaryDefaults.set(
+            [UsageProvider.antigravity.rawValue: MenuBarMetricPreference.tertiary.rawValue],
+            forKey: "menuBarMetricPreferences")
+
+        let tertiarySettings = SettingsStore(userDefaults: tertiaryDefaults)
+
+        #expect(tertiarySettings.menuBarMetricPreference(for: .antigravity) == .primary)
+
+        let migratedDefaults = UserDefaults(suiteName: #function + ".migrated")!
+        migratedDefaults.removePersistentDomain(forName: #function + ".migrated")
+        migratedDefaults.set(
+            [UsageProvider.antigravity.rawValue: MenuBarMetricPreference.primary.rawValue],
+            forKey: "menuBarMetricPreferences")
+        migratedDefaults.set(true, forKey: "antigravityTwoPoolMetricPreferenceMigrated")
+
+        let migratedSettings = SettingsStore(userDefaults: migratedDefaults)
+
+        #expect(migratedSettings.menuBarMetricPreference(for: .antigravity) == .primary)
+    }
+
+    @Test
     func `menu bar metric preference handles zai and average`() {
         let settings = Self.makeSettingsStore(suite: "SettingsStoreAdditionalTests-metric")
 
@@ -25,6 +74,21 @@ struct SettingsStoreAdditionalTests {
         settings.setMenuBarMetricPreference(.average, for: .codex)
         #expect(settings.menuBarMetricPreference(for: .codex) == .automatic)
 
+        settings.setMenuBarMetricPreference(.primaryAndSecondary, for: .codex)
+        #expect(settings.menuBarMetricPreference(for: .codex) == .primaryAndSecondary)
+        #expect(settings.menuBarMetricSupportsPrimaryAndSecondary(for: .codex))
+
+        settings.setMenuBarMetricPreference(.primaryAndSecondary, for: .claude)
+        #expect(settings.menuBarMetricPreference(for: .claude) == .primaryAndSecondary)
+        #expect(settings.menuBarMetricSupportsPrimaryAndSecondary(for: .claude))
+
+        settings.setMenuBarMetricPreference(.monthlyPlan, for: .codex)
+        #expect(settings.menuBarMetricPreference(for: .codex) == .automatic)
+
+        settings.menuBarMetricPreferencesRaw[UsageProvider.codex.rawValue] = MenuBarMetricPreference.monthlyPlan
+            .rawValue
+        #expect(settings.menuBarMetricPreference(for: .codex) == .automatic)
+
         settings.setMenuBarMetricPreference(.average, for: .gemini)
         #expect(settings.menuBarMetricPreference(for: .gemini) == .average)
 
@@ -40,6 +104,11 @@ struct SettingsStoreAdditionalTests {
         #expect(settings.menuBarMetricPreference(for: .cursor) == .extraUsage)
         #expect(settings.menuBarMetricPreference(for: .cursor, snapshot: nil) == .automatic)
         #expect(settings.menuBarMetricSupportsExtraUsage(for: .cursor, snapshot: nil) == false)
+
+        settings.setMenuBarMetricPreference(.extraUsage, for: .claude)
+        #expect(settings.menuBarMetricPreference(for: .claude) == .extraUsage)
+        #expect(settings.menuBarMetricPreference(for: .claude, snapshot: nil) == .automatic)
+        #expect(settings.menuBarMetricSupportsExtraUsage(for: .claude, snapshot: nil) == false)
 
         settings.setMenuBarMetricPreference(.tertiary, for: .perplexity)
         #expect(settings.menuBarMetricPreference(for: .perplexity) == .tertiary)
@@ -68,6 +137,30 @@ struct SettingsStoreAdditionalTests {
 
         settings.setMenuBarMetricPreference(.extraUsage, for: .openrouter)
         #expect(settings.menuBarMetricPreference(for: .openrouter) == .automatic)
+    }
+
+    @Test
+    func `menu bar metric preference restricts mistral to payg or monthly plan`() {
+        let settings = Self.makeSettingsStore(suite: "SettingsStoreAdditionalTests-mistral-metric")
+
+        settings.setMenuBarMetricPreference(.monthlyPlan, for: .mistral)
+        #expect(settings.menuBarMetricPreference(for: .mistral) == .monthlyPlan)
+
+        settings.setMenuBarMetricPreference(.secondary, for: .mistral)
+        #expect(settings.menuBarMetricPreference(for: .mistral) == .automatic)
+    }
+
+    @Test
+    func `menu bar metric preference restricts text only balance providers to automatic`() {
+        let settings = Self.makeSettingsStore(suite: "SettingsStoreAdditionalTests-text-only-metric")
+
+        for provider in [UsageProvider.deepseek, .poe] {
+            settings.setMenuBarMetricPreference(.primary, for: provider)
+            #expect(settings.menuBarMetricPreference(for: provider) == .automatic)
+
+            settings.setMenuBarMetricPreference(.secondary, for: provider)
+            #expect(settings.menuBarMetricPreference(for: provider) == .automatic)
+        }
     }
 
     @Test
@@ -135,7 +228,6 @@ struct SettingsStoreAdditionalTests {
             minimaxCookieStore: InMemoryMiniMaxCookieStore(),
             minimaxAPITokenStore: InMemoryMiniMaxAPITokenStore(),
             kimiTokenStore: InMemoryKimiTokenStore(),
-            kimiK2TokenStore: InMemoryKimiK2TokenStore(),
             augmentCookieStore: InMemoryCookieHeaderStore(),
             ampCookieStore: InMemoryCookieHeaderStore(),
             copilotTokenStore: InMemoryCopilotTokenStore(),

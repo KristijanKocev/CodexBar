@@ -11,8 +11,12 @@ extension ProvidersPane {
         self.providerSubtitle(provider)
     }
 
-    func _test_menuBarMetricPicker(for provider: UsageProvider) -> ProviderSettingsPickerDescriptor? {
-        self.menuBarMetricPicker(for: provider)
+    func _test_providerSidebarSubtitle(_ provider: UsageProvider) -> String {
+        self.providerSidebarSubtitle(provider)
+    }
+
+    func _test_moveProviders(fromOffsets: IndexSet, toOffset: Int) {
+        self.moveProviders(fromOffsets: fromOffsets, toOffset: toOffset)
     }
 
     func _test_settingsPickers(for provider: UsageProvider) -> [ProviderSettingsPickerDescriptor] {
@@ -53,7 +57,8 @@ extension ProvidersPane {
                     lastAppActiveRunAtByID.removeValue(forKey: id)
                 }
             },
-            requestConfirmation: { _ in })
+            requestConfirmation: { _ in },
+            runLoginFlow: {})
         return impl.settingsPickers(context: context)
             .filter { $0.isVisible?() ?? true }
     }
@@ -64,6 +69,10 @@ extension ProvidersPane {
 
     func _test_menuCardModel(for provider: UsageProvider) -> UsageMenuCardView.Model {
         self.menuCardModel(for: provider)
+    }
+
+    func _test_openAIWebDiagnostic(for provider: UsageProvider) -> String? {
+        self.openAIWebDiagnostic(for: provider)
     }
 
     func _test_providerErrorDisplay(for provider: UsageProvider) -> ProviderErrorDisplay? {
@@ -138,10 +147,6 @@ enum ProvidersPaneTestHarness {
         _ = pane._test_providerSubtitle(.kimi)
         _ = pane._test_providerSubtitle(.gemini)
 
-        _ = pane._test_menuBarMetricPicker(for: .codex)
-        _ = pane._test_menuBarMetricPicker(for: .gemini)
-        _ = pane._test_menuBarMetricPicker(for: .zai)
-
         if let descriptor = pane._test_tokenAccountDescriptor(for: .claude) {
             _ = descriptor.isVisible?()
             _ = descriptor.accounts()
@@ -162,6 +167,7 @@ enum ProvidersPaneTestHarness {
             isEnabled: enabledBinding,
             subtitle: "Subtitle",
             model: model,
+            openAIWebDiagnostic: pane._test_openAIWebDiagnostic(for: .codex),
             settingsPickers: [descriptors.picker],
             settingsToggles: [descriptors.toggle],
             settingsFields: [descriptors.fieldPlain, descriptors.fieldSecure],
@@ -172,7 +178,7 @@ enum ProvidersPaneTestHarness {
             onRefresh: {},
             showsSupplementarySettingsContent: true,
             supplementarySettingsContent: {
-                ProviderSettingsSection(title: "Accounts") {
+                Section("Accounts") {
                     Text("Supplementary")
                 }
             }).body
@@ -246,8 +252,13 @@ enum ProvidersPaneTestHarness {
             accounts: { [] },
             activeIndex: { 0 },
             setActiveIndex: { _ in },
-            addAccount: { _, _ in },
+            showsOrganizationField: false,
+            showsTeamModeControls: false,
+            addAccount: { _, _, _, _, _ in },
+            updateAccount: { _, _, _, _ in },
             removeAccount: { _ in },
+            primaryAddActionTitle: nil,
+            primaryAddAction: nil,
             openConfigFile: {},
             reloadFromDisk: {})
 

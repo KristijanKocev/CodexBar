@@ -14,7 +14,7 @@ Goal: adding a provider should feel like:
 - add one implementation (UI hooks only)
 - done (tests + docs)
 
-This doc describes the **current provider architecture** (post-macro registry) and the exact steps to add a new provider.
+This doc describes the **current provider architecture** and the exact steps to add a new provider.
 
 ## Terms
 - **Provider**: a source of usage/quota/status data (Codex, Claude, Gemini, Antigravity, Cursor, …).
@@ -39,14 +39,15 @@ Common building blocks already exist:
 - OpenAI dashboard web scrape: `OpenAIDashboardFetcher` (WKWebView + JS)
 - cost usage: local log scanner (Codex + Claude)
 
-The old “switch provider” wiring is gone. Everything should be driven by the descriptor and its strategies.
+Provider behavior is descriptor-driven. Two explicit, exhaustive registries form the bootstrap boundary:
+`ProviderDescriptorRegistry` owns core descriptors and `ProviderImplementationRegistry` owns app implementations.
 
 ## Provider descriptor (source of truth)
 
 Introduce a single descriptor per provider:
 - `id` (stable `UsageProvider`)
 - display/labels/URLs (menu title, dashboard URL, status URL)
-- UI branding (icon name, primary color)
+- UI branding (icon name, primary color, 2–3-color confetti palette)
 - capabilities (supportsCredits, supportsTokenCost, supportsStatusPolling, supportsLogin)
 - fetch plan (allowed `--source` modes + ordered strategy pipeline)
 - CLI metadata (cliName, aliases, version provider)
@@ -71,6 +72,7 @@ Each run returns a `ProviderFetchOutcome` with **attempts + errors** for debug U
 Expose a narrow set of protocols/structs that provider implementations can use:
 - `KeychainAPI`: read-only, allowlisted service/account pairs
 - `BrowserCookieAPI`: import cookies by domain list; returns cookie header + diagnostics
+- `BrowserLocalStorageAPI`: read origin-scoped key/value snapshots across browser profiles
 - `PTYAPI`: run CLI interactions with timeouts + “send on substring” + stop rules
 - `HTTPAPI`: URLSession wrapper with domain allowlist + standard headers + tracing
 - `WebViewScrapeAPI`: WKWebView lease + `evaluateJavaScript` + snapshot dumping
@@ -93,12 +95,11 @@ Rule: providers do not talk to `FileManager`, `Security`, or “browser internal
 ## Minimal provider example (copy-paste)
 
 ```swift
-import CodexBarMacroSupport
 import Foundation
 
-@ProviderDescriptorRegistration
-@ProviderDescriptorDefinition
 public enum ExampleProviderDescriptor {
+    public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
+
     static func makeDescriptor() -> ProviderDescriptor {
         ProviderDescriptor(
             id: .example,
@@ -121,7 +122,11 @@ public enum ExampleProviderDescriptor {
             branding: ProviderBranding(
                 iconStyle: .codex,
                 iconResourceName: "ProviderIcon-example",
-                color: ProviderColor(red: 0.2, green: 0.6, blue: 0.8)),
+                color: ProviderColor(red: 0.2, green: 0.6, blue: 0.8),
+                confettiPalette: [
+                    ProviderColor(hex: 0x3399CC),
+                    ProviderColor(hex: 0x66C2FF),
+                ]),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Example cost summary is not supported." }),
@@ -159,6 +164,18 @@ struct ExampleFetchStrategy: ProviderFetchStrategy {
 - Reliability: providers must be timeout-bounded; no unbounded waits on network/PTY/UI.
 - Degradation: prefer cached data over flapping; show clear errors when stale.
 
+## Hosted relay eligibility
+
+Hosted relays and upstream aggregators need enough public evidence for maintainers and users to evaluate the trust
+boundary:
+
+- An identifiable legal operator and jurisdiction.
+- Verifiable authorization to resell or provide the advertised upstream access; operator self-assertion alone is not
+  sufficient.
+- A public operating track record that supports ongoing reliability, security, and maintenance review.
+
+An integration can be restored when missing operator or authorization evidence becomes available.
+
 ## Adding a new provider (current flow)
 
 Checklist:
@@ -169,15 +186,15 @@ Checklist:
   - `<ProviderID>Probe.swift` / `<ProviderID>Fetcher.swift`: concrete fetcher logic.
   - `<ProviderID>Models.swift`: snapshot structs.
   - `<ProviderID>Parser.swift` (if needed).
-- Attach `@ProviderDescriptorRegistration` + `@ProviderDescriptorDefinition` to the descriptor type.
-  Implement `static func makeDescriptor() -> ProviderDescriptor`.
-- Attach `@ProviderImplementationRegistration` to the implementation type (macros auto-register).
-  - No manual list edits.
+- Define a cached `public static let descriptor` and `static func makeDescriptor() -> ProviderDescriptor`.
+- Add the descriptor to `ProviderDescriptorRegistry.descriptorsByID`.
 - Add `Sources/CodexBar/Providers/<ProviderID>/<ProviderID>ProviderImplementation.swift`:
   - `ProviderImplementation` only for settings/login UI hooks.
-- Add icons + color in descriptor:
+- Add an exhaustive case to `ProviderImplementationRegistry.makeImplementation(for:)`.
+- Add icons + colors in descriptor:
   - `iconName` must match `ProviderIcon-<id>` asset.
   - Color used in menu cards + switcher.
+  - Provide a curated `confettiPalette` with 2–3 colors for reset celebrations.
 - If CLI-specific behavior is needed:
   - add `cliName`, `cliAliases`, `sourceModes`, `versionProvider` in descriptor.
   - strategies decide which `--source` modes apply.

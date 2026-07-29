@@ -24,14 +24,24 @@ struct MenuDescriptor {
     enum Entry {
         case text(String, TextStyle)
         case action(String, MenuAction)
+        case unavailable(String, String?)
         case submenu(String, String?, [SubmenuItem])
         case divider
+
+        var isActionable: Bool {
+            switch self {
+            case .action, .submenu, .unavailable: true
+            case .text, .divider: false
+            }
+        }
     }
 
     enum MenuActionSystemImage: String {
+        case installUpdate = "arrow.down.circle"
         case refresh = "arrow.clockwise"
-        case dashboard = "chart.bar"
+        case dashboard = "chart.xyaxis.line"
         case statusPage = "waveform.path.ecg"
+        case changelog = "list.bullet.rectangle"
         case addAccount = "plus"
         case systemAccount = "person.crop.circle"
         case switchAccount = "key"
@@ -55,8 +65,10 @@ struct MenuDescriptor {
         case refreshAugmentSession
         case dashboard
         case statusPage
+        case changelog
         case addCodexAccount
         case requestCodexSystemPromotion(UUID)
+        case addProviderAccount(UsageProvider)
         case switchAccount(UsageProvider)
         case openTerminal(command: String)
         case loginToProvider(url: String)
@@ -64,6 +76,7 @@ struct MenuDescriptor {
         case about
         case quit
         case copyError(String)
+        case focusAgentSession(AgentSession, remoteHost: String?)
     }
 
     var sections: [Section]
@@ -76,7 +89,12 @@ struct MenuDescriptor {
         managedCodexAccountCoordinator: ManagedCodexAccountCoordinator? = nil,
         codexAccountPromotionCoordinator: CodexAccountPromotionCoordinator? = nil,
         updateReady: Bool,
-        includeContextualActions: Bool = true) -> MenuDescriptor
+        includeContextualActions: Bool = true,
+        agentSessionsEnabled: Bool = false,
+        agentSessionLabelStyle: AgentSessionLabelStyle = .project,
+        localAgentSessions: [AgentSession] = [],
+        remoteAgentHosts: [RemoteSessionHostResult] = [],
+        now: Date = Date()) -> MenuDescriptor
     {
         var sections: [Section] = []
 
@@ -110,7 +128,7 @@ struct MenuDescriptor {
                     sections.append(accountSection)
                 }
             } else {
-                sections.append(Section(entries: [.text("No usage configured.", .secondary)]))
+                sections.append(Section(entries: [.text(L("No usage configured."), .secondary)]))
             }
         }
 
@@ -125,9 +143,75 @@ struct MenuDescriptor {
                 sections.append(actions)
             }
         }
+        if agentSessionsEnabled {
+            sections.append(Self.agentSessionsSection(
+                localSessions: localAgentSessions,
+                remoteHosts: remoteAgentHosts,
+                labelStyle: agentSessionLabelStyle,
+                now: now))
+        }
         sections.append(Self.metaSection(updateReady: updateReady))
 
         return MenuDescriptor(sections: sections)
+    }
+
+    static func agentSessionsSection(
+        localSessions: [AgentSession],
+        remoteHosts: [RemoteSessionHostResult],
+        labelStyle: AgentSessionLabelStyle = .project,
+        now: Date = Date()) -> Section
+    {
+        let totalCount = localSessions.count + remoteHosts.reduce(0) { $0 + $1.sessions.count }
+        var entries: [Entry] = [.text("Agent Sessions (\(totalCount))", .headline)]
+
+        for session in localSessions {
+            entries.append(.action(
+                self.agentSessionRowTitle(session, labelStyle: labelStyle, now: now),
+                .focusAgentSession(session, remoteHost: nil)))
+        }
+        for remoteHost in remoteHosts {
+            if let error = remoteHost.error {
+                entries.append(.unavailable("\(remoteHost.host) — unreachable", error))
+                continue
+            }
+            entries.append(.text("\(remoteHost.host) — \(remoteHost.sessions.count)", .secondary))
+            for session in remoteHost.sessions {
+                entries.append(.action(
+                    self.agentSessionRowTitle(session, labelStyle: labelStyle, now: now),
+                    .focusAgentSession(session, remoteHost: remoteHost.host)))
+            }
+        }
+        if totalCount == 0 {
+            entries.append(.unavailable("No agent sessions found", nil))
+        }
+        return Section(entries: entries)
+    }
+
+    private static func agentSessionRowTitle(
+        _ session: AgentSession,
+        labelStyle: AgentSessionLabelStyle,
+        now: Date) -> String
+    {
+        let state = session.state == .active ? "●" : "○"
+        let providerGlyph = session.provider == .codex ? "⌘" : "✦"
+        let label = labelStyle.label(for: session)
+        return "\(state) \(providerGlyph) \(label) — \(session.provider.rawValue) · " +
+            "\(session.source.rawValue) · \(self.agentSessionAge(session, now: now))"
+    }
+
+    private static func agentSessionAge(_ session: AgentSession, now: Date) -> String {
+        guard let activity = session.lastActivityAt ?? session.startedAt else { return "now" }
+        let seconds = max(0, Int(now.timeIntervalSince(activity)))
+        if seconds < 60 {
+            return "\(seconds)s"
+        }
+        if seconds < 3600 {
+            return "\(seconds / 60)m"
+        }
+        if seconds < 86400 {
+            return "\(seconds / 3600)h"
+        }
+        return "\(seconds / 86400)d"
     }
 
     private static func usageSection(
@@ -138,16 +222,24 @@ struct MenuDescriptor {
         let meta = store.metadata(for: provider)
         var entries: [Entry] = []
         let headlineText: String = {
-            if let ver = Self.versionNumber(for: provider, store: store) { return "\(meta.displayName) \(ver)" }
+            if let ver = Self.versionNumber(for: provider, store: store) {
+                return "\(meta.displayName) \(ver)"
+            }
             return meta.displayName
         }()
         entries.append(.text(headlineText, .headline))
 
         if let snap = store.snapshot(for: provider) {
             let resetStyle = settings.resetTimeDisplayStyle
+            let labels = Self.rateWindowLabels(provider: provider, metadata: meta, snapshot: snap)
             if let primary = snap.primary {
-                let primaryWindow = if provider == .warp || provider == .kilo || provider == .abacus {
-                    // Warp/Kilo/Abacus primary uses resetDescription for non-reset detail
+                let primaryDetail = primary.resetDescription?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let primaryDescriptionIsDetail = provider == .warp || provider == .kilo || provider == .abacus ||
+                    provider == .deepseek || provider == .deepinfra || provider == .neuralwatt ||
+                    provider == .azureopenai || provider == .mimo || provider == .qoder || provider == .sub2api ||
+                    provider == .chutes
+                let primaryWindow = if primaryDescriptionIsDetail {
+                    // Some providers use resetDescription for non-reset detail
                     // (e.g., "Unlimited", "X/Y credits"). Avoid rendering it as a "Resets ..." line.
                     RateWindow(
                         usedPercent: primary.usedPercent,
@@ -159,11 +251,18 @@ struct MenuDescriptor {
                 }
                 Self.appendRateWindow(
                     entries: &entries,
-                    title: meta.sessionLabel,
+                    title: labels.primary,
                     window: primaryWindow,
                     resetStyle: resetStyle,
                     showUsed: settings.usageBarsShowUsed)
-                if provider == .warp || provider == .kilo || provider == .abacus,
+                if primaryDescriptionIsDetail,
+                   let primaryDetail,
+                   !primaryDetail.isEmpty
+                {
+                    entries.append(.text(primaryDetail, .secondary))
+                }
+                if provider == .crof,
+                   primary.resetsAt != nil,
                    let detail = primary.resetDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !detail.isEmpty
                 {
@@ -172,28 +271,33 @@ struct MenuDescriptor {
                 if provider == .abacus,
                    let pace = store.weeklyPace(provider: provider, window: primary)
                 {
-                    let paceSummary = UsagePaceText.weeklySummary(pace: pace)
+                    let paceSummary = UsagePaceText.weeklySummary(provider: provider, pace: pace)
+                    entries.append(.text(paceSummary, .secondary))
+                }
+                if let paceSummary = UsagePaceText.sessionSummary(provider: provider, window: primary) {
                     entries.append(.text(paceSummary, .secondary))
                 }
             }
             if let weekly = snap.secondary {
                 let weeklyResetOverride: String? = {
-                    guard provider == .warp || provider == .kilo || provider == .perplexity else { return nil }
+                    guard provider == .warp || provider == .kilo || provider == .perplexity || provider == .crof ||
+                        provider == .sub2api || provider == .chutes
+                    else { return nil }
                     let detail = weekly.resetDescription?.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard let detail, !detail.isEmpty else { return nil }
-                    if provider == .kilo, weekly.resetsAt != nil {
+                    if [.kilo, .chutes].contains(provider), weekly.resetsAt != nil {
                         return nil
                     }
                     return detail
                 }()
                 Self.appendRateWindow(
                     entries: &entries,
-                    title: meta.weeklyLabel,
+                    title: labels.secondary,
                     window: weekly,
                     resetStyle: resetStyle,
                     showUsed: settings.usageBarsShowUsed,
                     resetOverride: weeklyResetOverride)
-                if provider == .kilo,
+                if [.kilo, .chutes].contains(provider),
                    weekly.resetsAt != nil,
                    let detail = weekly.resetDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !detail.isEmpty
@@ -201,33 +305,37 @@ struct MenuDescriptor {
                     entries.append(.text(detail, .secondary))
                 }
                 if let pace = store.weeklyPace(provider: provider, window: weekly) {
-                    let paceSummary = UsagePaceText.weeklySummary(pace: pace)
+                    let paceSummary = UsagePaceText.weeklySummary(provider: provider, pace: pace)
                     entries.append(.text(paceSummary, .secondary))
                 }
             }
-            if meta.supportsOpus, let opus = snap.tertiary {
+            if labels.showsTertiary, let opus = snap.tertiary {
                 // Perplexity purchased credits don't reset; show the balance as plain text.
-                let opusResetOverride: String? = provider == .perplexity
+                let opusResetOverride: String? = provider == .perplexity || provider == .sub2api
                     ? opus.resetDescription?.trimmingCharacters(in: .whitespacesAndNewlines)
                     : nil
                 Self.appendRateWindow(
                     entries: &entries,
-                    title: meta.opusLabel ?? "Sonnet",
+                    title: labels.tertiary,
                     window: opus,
                     resetStyle: resetStyle,
                     showUsed: settings.usageBarsShowUsed,
                     resetOverride: opusResetOverride)
             }
 
-            if let cost = snap.providerCost {
-                if cost.currencyCode == "Quota" {
-                    let used = String(format: "%.0f", cost.used)
-                    let limit = String(format: "%.0f", cost.limit)
-                    entries.append(.text("Quota: \(used) / \(limit)", .primary))
-                }
+            Self.appendProviderUsageSummaries(
+                entries: &entries,
+                snapshot: snap,
+                showOptionalUsage: settings.showOptionalCreditsAndExtraUsage)
+            if snap.rateLimitsUnavailable(for: provider) {
+                entries.append(.text(L("Limits not available"), .secondary))
             }
+        } else if !store.isStale(provider: provider),
+                  store.knownLimitsAvailability(for: provider)?.isUnavailable == true
+        {
+            entries.append(.text(L("Limits not available"), .secondary))
         } else {
-            entries.append(.text("No usage yet", .secondary))
+            entries.append(.text(L("No usage yet"), .secondary))
         }
 
         let usageContext = ProviderMenuUsageContext(
@@ -240,6 +348,65 @@ struct MenuDescriptor {
             .appendUsageMenuEntries(context: usageContext, entries: &entries)
 
         return Section(entries: entries)
+    }
+
+    private static func appendProviderUsageSummaries(
+        entries: inout [Entry],
+        snapshot: UsageSnapshot,
+        showOptionalUsage: Bool)
+    {
+        if let cost = snapshot.providerCost {
+            if cost.currencyCode == "Quota" {
+                let used = String(format: "%.0f", cost.used)
+                let limit = String(format: "%.0f", cost.limit)
+                entries.append(.text("\(L("Quota")): \(used) / \(limit)", .primary))
+            }
+        }
+        if let openAIAPIUsage = snapshot.openAIAPIUsage {
+            Self.appendOpenAIAPIUsageSummary(entries: &entries, usage: openAIAPIUsage)
+        }
+        if let claudeAdminAPIUsage = snapshot.claudeAdminAPIUsage {
+            Self.appendClaudeAdminAPIUsageSummary(entries: &entries, usage: claudeAdminAPIUsage)
+        }
+        if let openRouterUsage = snapshot.openRouterUsage {
+            Self.appendOpenRouterUsageSummary(entries: &entries, usage: openRouterUsage)
+        }
+        if let clawRouterUsage = snapshot.clawRouterUsage {
+            entries.append(.text(
+                "\(UsageFormatter.tokenCountString(clawRouterUsage.requestCount)) \(L("requests")) · " +
+                    "\(UsageFormatter.tokenCountString(clawRouterUsage.totalTokens)) \(L("tokens"))",
+                .secondary))
+            if !clawRouterUsage.providers.isEmpty {
+                let mix = clawRouterUsage.providers.prefix(5)
+                    .map { "\($0.provider): \(UsageFormatter.tokenCountString($0.requestCount))" }
+                    .joined(separator: " · ")
+                entries.append(.text("Routed providers: \(mix)", .secondary))
+            }
+        }
+        if let wayfinderUsage = snapshot.wayfinderUsage {
+            Self.appendWayfinderUsageSummary(entries: &entries, usage: wayfinderUsage)
+        }
+        if let poeUsage = snapshot.poeUsage, !poeUsage.daily.isEmpty {
+            Self.appendPoeUsageSummary(entries: &entries, usage: poeUsage)
+        }
+        if let mistralUsage = snapshot.mistralUsage, !mistralUsage.daily.isEmpty {
+            Self.appendMistralUsageSummary(entries: &entries, usage: mistralUsage)
+        }
+        if let mimoUsage = snapshot.mimoUsage {
+            entries.append(.text("\(L("Balance")): \(mimoUsage.balanceDetail)", .primary))
+        }
+        // Sakana pay-as-you-go is optional data gated by "Show optional credits and extra usage".
+        // Gate the render on the setting too, not just the fetch: toggling the setting off only
+        // rebuilds the menu, it does not immediately refetch, so a previously-populated
+        // sakanaPayAsYouGo would otherwise linger in the cached snapshot until the next refresh.
+        if showOptionalUsage, let sakanaPayAsYouGo = snapshot.sakanaPayAsYouGo {
+            entries.append(.text("\(L("Balance")): \(sakanaPayAsYouGo.balanceDetail)", .primary))
+            if let periodUsageTotal = sakanaPayAsYouGo.periodUsageTotal {
+                entries.append(.text(
+                    "\(L("Usage")): \(UsageFormatter.usdString(periodUsageTotal))",
+                    .secondary))
+            }
+        }
     }
 
     private static func accountSection(
@@ -274,28 +441,64 @@ struct MenuDescriptor {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let redactedEmail = PersonalInfoRedactor.redactEmail(emailText, isEnabled: hidePersonalInfo)
 
-        if let emailText, !emailText.isEmpty {
-            entries.append(.text("Account: \(redactedEmail)", .secondary))
+        if let emailText, !emailText.isEmpty, !redactedEmail.isEmpty {
+            entries.append(.text("\(L("Account")): \(redactedEmail)", .secondary))
         }
-        if provider == .kilo {
+        if provider == .kiro {
+            if let plan = snapshot?.kiroUsage?.displayPlanName,
+               !plan.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                entries.append(.text("\(L("Plan")): \(plan)", .secondary))
+            }
+            if let loginMethodText, !loginMethodText.isEmpty {
+                entries.append(.text("\(L("Auth")): \(loginMethodText)", .secondary))
+            }
+            if let overages = snapshot?.kiroUsage?.overagesStatus,
+               !overages.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                entries.append(.text("\(L("Overages")): \(overages)", .secondary))
+            }
+        } else if provider == .kilo {
             let kiloLogin = self.kiloLoginParts(loginMethod: loginMethodText)
             if let pass = kiloLogin.pass {
-                entries.append(.text("Plan: \(AccountFormatter.plan(pass))", .secondary))
+                entries.append(.text("\(L("Plan")): \(AccountFormatter.plan(pass, provider: provider))", .secondary))
             }
             for detail in kiloLogin.details {
-                entries.append(.text("Activity: \(detail)", .secondary))
+                entries.append(.text("\(L("Activity")): \(detail)", .secondary))
             }
         } else if let loginMethodText, !loginMethodText.isEmpty {
-            entries.append(.text("Plan: \(AccountFormatter.plan(loginMethodText))", .secondary))
+            if provider == .openrouter || provider == .mimo || provider == .poe,
+               loginMethodText.localizedCaseInsensitiveContains("balance:")
+            {
+                let balanceValue = loginMethodText
+                    .replacingOccurrences(
+                        of: #"(?i)^\s*balance:\s*"#,
+                        with: "",
+                        options: [.regularExpression])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let value = balanceValue.isEmpty ? loginMethodText : balanceValue
+                entries.append(
+                    .text("\(L("Balance")): \(AccountFormatter.plan(value, provider: provider))", .secondary))
+            } else {
+                entries.append(
+                    .text(
+                        "\(L("Plan")): \(AccountFormatter.plan(loginMethodText, provider: provider))",
+                        .secondary))
+            }
         }
 
         if metadata.usesAccountFallback {
             if emailText?.isEmpty ?? true, let fallbackEmail = fallback.email, !fallbackEmail.isEmpty {
                 let redacted = PersonalInfoRedactor.redactEmail(fallbackEmail, isEnabled: hidePersonalInfo)
-                entries.append(.text("Account: \(redacted)", .secondary))
+                if !redacted.isEmpty {
+                    entries.append(.text("\(L("Account")): \(redacted)", .secondary))
+                }
             }
             if loginMethodText?.isEmpty ?? true, let fallbackPlan = fallback.plan, !fallbackPlan.isEmpty {
-                entries.append(.text("Plan: \(AccountFormatter.plan(fallbackPlan))", .secondary))
+                entries.append(
+                    .text(
+                        "\(L("Plan")): \(AccountFormatter.plan(fallbackPlan, provider: provider))",
+                        .secondary))
             }
         }
 
@@ -349,12 +552,14 @@ struct MenuDescriptor {
         let targetProvider = provider ?? store.enabledProviders().first
         let metadata = targetProvider.map { store.metadata(for: $0) }
         let fallbackAccount = targetProvider.map { store.accountInfo(for: $0) } ?? account
+        let hasAccount = self.hasAccount(for: targetProvider, store: store, account: fallbackAccount)
         let loginContext = targetProvider.map {
             ProviderMenuLoginContext(
                 provider: $0,
                 store: store,
                 settings: store.settings,
-                account: fallbackAccount)
+                account: fallbackAccount,
+                hasAccount: hasAccount)
         }
 
         // Show "Add Account" if no account, "Switch Account" if logged in
@@ -368,8 +573,7 @@ struct MenuDescriptor {
                 entries.append(.action(override.label, override.action))
             } else {
                 let loginAction = self.switchAccountTarget(for: provider, store: store)
-                let hasAccount = self.hasAccount(for: provider, store: store, account: fallbackAccount)
-                let accountLabel = hasAccount ? "Switch Account..." : "Add Account..."
+                let accountLabel = hasAccount ? L("Switch Account...") : L("Add Account...")
                 entries.append(.action(accountLabel, loginAction))
             }
         }
@@ -387,10 +591,13 @@ struct MenuDescriptor {
         }
 
         if metadata?.dashboardURL != nil {
-            entries.append(.action("Usage Dashboard", .dashboard))
+            entries.append(.action(L("Usage Dashboard"), .dashboard))
         }
         if metadata?.statusPageURL != nil || metadata?.statusLinkURL != nil {
-            entries.append(.action("Status Page", .statusPage))
+            entries.append(.action(L("Status Page"), .statusPage))
+        }
+        if store.settings.providerChangelogLinksEnabled, metadata?.changelogURL != nil {
+            entries.append(.action(L("Changelog"), .changelog))
         }
 
         if let statusLine = self.statusLine(for: provider, store: store) {
@@ -403,13 +610,13 @@ struct MenuDescriptor {
     private static func metaSection(updateReady: Bool) -> Section {
         var entries: [Entry] = []
         if updateReady {
-            entries.append(.action("Update ready, restart now?", .installUpdate))
+            entries.append(.action(L("Update ready, restart now?"), .installUpdate))
         }
         entries.append(contentsOf: [
-            .action("Refresh", .refresh),
-            .action("Settings...", .settings),
-            .action("About CodexBar", .about),
-            .action("Quit", .quit),
+            .action(L("Refresh"), .refresh),
+            .action(L("Settings..."), .settings),
+            .action(L("About CodexBar"), .about),
+            .action(L("Quit"), .quit),
         ])
         return Section(entries: entries)
     }
@@ -430,15 +637,26 @@ struct MenuDescriptor {
     }
 
     private static func switchAccountTarget(for provider: UsageProvider?, store: UsageStore) -> MenuAction {
-        if let provider { return .switchAccount(provider) }
-        if let enabled = store.enabledProviders().first { return .switchAccount(enabled) }
+        if let provider {
+            return .switchAccount(provider)
+        }
+        if let enabled = store.enabledProviders().first {
+            return .switchAccount(enabled)
+        }
         return .switchAccount(.codex)
     }
 
     private static func hasAccount(for provider: UsageProvider?, store: UsageStore, account: AccountInfo) -> Bool {
         let target = provider ?? store.enabledProviders().first ?? .codex
-        if let email = store.snapshot(for: target)?.accountEmail(for: target),
+        let snapshot = store.snapshot(for: target)
+        if let email = snapshot?.accountEmail(for: target),
            !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return true
+        }
+        if target == .claude,
+           snapshot?.identity(for: .claude) != nil,
+           snapshot?.hasRateLimitWindows == true
         {
             return true
         }
@@ -450,6 +668,41 @@ struct MenuDescriptor {
             return true
         }
         return false
+    }
+
+    private static func rateWindowLabels(
+        provider: UsageProvider,
+        metadata: ProviderMetadata,
+        snapshot: UsageSnapshot) -> (primary: String, secondary: String, tertiary: String, showsTertiary: Bool)
+    {
+        if provider == .factory, snapshot.tertiary != nil {
+            return ("5-hour", L("Weekly"), L("Monthly"), true)
+        }
+        let primaryLabel = if provider == .grok {
+            GrokProviderDescriptor.primaryLabel(window: snapshot.primary) ?? metadata.sessionLabel
+        } else if provider == .doubao {
+            DoubaoProviderDescriptor.primaryLabel(window: snapshot.primary) ?? metadata.sessionLabel
+        } else if provider == .sub2api {
+            Sub2APIProviderDescriptor.primaryLabel(details: snapshot.sub2APIUsage) ?? metadata.sessionLabel
+        } else if provider == .amp {
+            AmpProviderDescriptor.primaryLabel(details: snapshot.ampUsage) ?? metadata.sessionLabel
+        } else if provider == .alibabatokenplan {
+            AlibabaTokenPlanProviderDescriptor.primaryLabel(window: snapshot.primary) ?? metadata.sessionLabel
+        } else {
+            metadata.sessionLabel
+        }
+        let secondaryLabel = if provider == .amp {
+            AmpProviderDescriptor.secondaryLabel(details: snapshot.ampUsage) ?? metadata.weeklyLabel
+        } else if provider == .alibabatokenplan {
+            AlibabaTokenPlanProviderDescriptor.secondaryLabel(window: snapshot.secondary) ?? metadata.weeklyLabel
+        } else {
+            metadata.weeklyLabel
+        }
+        return (
+            L(primaryLabel),
+            L(secondaryLabel),
+            metadata.opusLabel.map(L) ?? L("Sonnet"),
+            metadata.supportsOpus)
     }
 
     private static func appendRateWindow(
@@ -482,8 +735,12 @@ struct MenuDescriptor {
 }
 
 private enum AccountFormatter {
-    static func plan(_ text: String) -> String {
-        let cleaned = CodexPlanFormatting.displayName(text) ?? UsageFormatter.cleanPlanName(text)
+    static func plan(_ text: String, provider: UsageProvider) -> String {
+        let cleaned = if provider == .codex {
+            CodexPlanFormatting.displayName(text) ?? UsageFormatter.cleanPlanName(text)
+        } else {
+            UsageFormatter.cleanPlanName(text)
+        }
         return cleaned.isEmpty ? text : cleaned
     }
 
@@ -495,19 +752,24 @@ private enum AccountFormatter {
 extension MenuDescriptor.MenuAction {
     var systemImageName: String? {
         switch self {
-        case .installUpdate, .settings, .about, .quit:
-            nil
+        case .installUpdate: MenuDescriptor.MenuActionSystemImage.installUpdate.rawValue
+        case .settings: MenuDescriptor.MenuActionSystemImage.settings.rawValue
+        case .about: MenuDescriptor.MenuActionSystemImage.about.rawValue
+        case .quit: MenuDescriptor.MenuActionSystemImage.quit.rawValue
         case .refresh: MenuDescriptor.MenuActionSystemImage.refresh.rawValue
         case .refreshAugmentSession: MenuDescriptor.MenuActionSystemImage.refresh.rawValue
         case .dashboard: MenuDescriptor.MenuActionSystemImage.dashboard.rawValue
         case .statusPage: MenuDescriptor.MenuActionSystemImage.statusPage.rawValue
-        case .addCodexAccount: MenuDescriptor.MenuActionSystemImage.addAccount.rawValue
+        case .changelog: MenuDescriptor.MenuActionSystemImage.changelog.rawValue
+        case .addCodexAccount, .addProviderAccount: MenuDescriptor.MenuActionSystemImage.addAccount.rawValue
         case .requestCodexSystemPromotion:
             nil
         case .switchAccount: MenuDescriptor.MenuActionSystemImage.switchAccount.rawValue
         case .openTerminal: MenuDescriptor.MenuActionSystemImage.openTerminal.rawValue
         case .loginToProvider: MenuDescriptor.MenuActionSystemImage.loginToProvider.rawValue
         case .copyError: MenuDescriptor.MenuActionSystemImage.copyError.rawValue
+        case .focusAgentSession:
+            nil
         }
     }
 }

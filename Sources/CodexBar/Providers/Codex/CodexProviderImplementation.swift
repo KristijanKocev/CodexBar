@@ -1,9 +1,7 @@
 import CodexBarCore
-import CodexBarMacroSupport
 import Foundation
 import SwiftUI
 
-@ProviderImplementationRegistration
 struct CodexProviderImplementation: ProviderImplementation {
     let id: UsageProvider = .codex
     let supportsLoginFlow: Bool = true
@@ -24,7 +22,9 @@ struct CodexProviderImplementation: ProviderImplementation {
 
     @MainActor
     func settingsSnapshot(context: ProviderSettingsSnapshotContext) -> ProviderSettingsSnapshotContribution? {
-        .codex(context.settings.codexSettingsSnapshot(tokenOverride: context.tokenOverride))
+        .codex(context.settings.codexSettingsSnapshot(
+            tokenOverride: context.tokenOverride,
+            activeSourceOverride: context.codexActiveSourceOverride))
     }
 
     @MainActor
@@ -70,16 +70,51 @@ struct CodexProviderImplementation: ProviderImplementation {
                 }
             })
         let batterySaverBinding = context.boolBinding(\.openAIWebBatterySaverEnabled)
+        let historicalTrackingSubtitle = [
+            L("Stores local Codex usage history (8 weeks) to personalize Pace predictions."),
+            "[\(L("weekly_progress_work_days_title")) = \(L("Automatic"))]",
+        ].joined(separator: " ")
 
         return [
             ProviderSettingsToggleDescriptor(
+                id: "codex-local-session-cost-ledger",
+                title: "Local session cost estimates",
+                subtitle: [
+                    "Uses this Mac's Codex sessions instead of the selected managed account's session history.",
+                    "Works with organization API keys and does not require OpenAI billing or administrator access.",
+                    "Uses locally cached or bundled model prices without making a network request.",
+                    "This provider-specific toggle does not enable cost summaries for other providers.",
+                ].joined(separator: " "),
+                binding: context.boolBinding(\.codexLocalSessionCostLedgerEnabled),
+                statusText: nil,
+                actions: [],
+                isVisible: nil,
+                onChange: nil,
+                onAppDidBecomeActive: nil,
+                onAppearWhenEnabled: nil),
+            ProviderSettingsToggleDescriptor(
                 id: "codex-historical-tracking",
                 title: "Historical tracking",
-                subtitle: "Stores local Codex usage history (8 weeks) to personalize Pace predictions.",
+                subtitle: historicalTrackingSubtitle,
                 binding: context.boolBinding(\.historicalTrackingEnabled),
                 statusText: nil,
                 actions: [],
                 isVisible: nil,
+                onChange: nil,
+                onAppDidBecomeActive: nil,
+                onAppearWhenEnabled: nil),
+            ProviderSettingsToggleDescriptor(
+                id: "codex-spark-usage-visible",
+                title: "Show Codex Spark usage",
+                subtitle: [
+                    "Shows Codex Spark quota rows in the menu and provider preview.",
+                    "Requires optional credits and extra usage in Display settings.",
+                ].joined(separator: " "),
+                binding: context.boolBinding(\.codexSparkUsageVisible),
+                statusText: nil,
+                actions: [],
+                isVisible: nil,
+                isEnabled: { context.settings.showOptionalCreditsAndExtraUsage },
                 onChange: nil,
                 onAppDidBecomeActive: nil,
                 onAppearWhenEnabled: nil),
@@ -146,8 +181,11 @@ struct CodexProviderImplementation: ProviderImplementation {
         return [
             ProviderSettingsPickerDescriptor(
                 id: "codex-usage-source",
-                title: "Usage source",
-                subtitle: "Auto falls back to the next source if the preferred one fails.",
+                title: "Quota usage source",
+                subtitle: [
+                    "Controls live session and weekly quota fetching only.",
+                    "Local session cost estimates work independently.",
+                ].joined(separator: " "),
                 binding: usageBinding,
                 options: usageOptions,
                 isVisible: nil,
@@ -167,9 +205,7 @@ struct CodexProviderImplementation: ProviderImplementation {
                 isVisible: { context.settings.openAIWebAccessEnabled },
                 onChange: nil,
                 trailingText: {
-                    guard let entry = CookieHeaderCache.load(provider: .codex) else { return nil }
-                    let when = entry.storedAt.relativeDescription()
-                    return "Cached: \(entry.sourceLabel) • \(when)"
+                    ProviderCookieSourceUI.cachedTrailingText(provider: .codex)
                 }),
         ]
     }
@@ -199,9 +235,23 @@ struct CodexProviderImplementation: ProviderImplementation {
         else { return }
 
         if let credits = context.store.credits {
-            entries.append(.text("Credits: \(UsageFormatter.creditsString(from: credits.remaining))", .primary))
+            let remaining = credits.codexCreditLimit?.remaining ?? credits.remaining
+            entries.append(.text(
+                String(format: L("credits_remaining"), UsageFormatter.creditsString(from: remaining)),
+                .primary))
+            if let limit = credits.codexCreditLimit {
+                var parts = [
+                    L("%@ used", UsageFormatter.creditsNumberString(from: limit.used)),
+                ]
+                if let resetsAt = limit.resetsAt {
+                    parts.append(L("resets %@", UsageFormatter.resetDescription(from: resetsAt)))
+                }
+                entries.append(.text(parts.joined(separator: " · "), .secondary))
+            }
             if let latest = credits.events.first {
-                entries.append(.text("Last spend: \(UsageFormatter.creditEventSummary(latest))", .secondary))
+                entries.append(.text(
+                    String(format: L("last_spend"), UsageFormatter.creditEventSummary(latest)),
+                    .secondary))
             }
         } else {
             let hint = context.store.userFacingLastCreditsError ?? context.metadata.creditsHint
@@ -234,6 +284,9 @@ struct CodexProviderImplementation: ProviderImplementation {
                 action: action,
                 isEnabled: isEnabled,
                 isChecked: isChecked)
+        }
+        guard submenuItems.count > 1 || submenuItems.contains(where: { $0.isEnabled && $0.action != nil }) else {
+            return
         }
 
         entries.append(.submenu(

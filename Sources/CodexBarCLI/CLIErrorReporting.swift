@@ -1,14 +1,14 @@
 import CodexBarCore
 import Foundation
 
-enum CLIErrorKind: String, Encodable {
+enum CLIErrorKind: String, Encodable, Sendable {
     case args
     case config
     case provider
     case runtime
 }
 
-struct ProviderErrorPayload: Encodable {
+struct ProviderErrorPayload: Encodable, Sendable {
     let code: Int32
     let message: String
     let kind: CLIErrorKind?
@@ -49,6 +49,7 @@ extension CodexBarCLI {
     static func makeProviderErrorPayload(
         provider: UsageProvider,
         account: String?,
+        cacheAccountKey: String? = nil,
         source: String,
         status: ProviderStatusPayload?,
         error: Error,
@@ -57,6 +58,7 @@ extension CodexBarCLI {
         ProviderPayload(
             provider: provider,
             account: account,
+            cacheAccountKey: cacheAccountKey,
             version: nil,
             source: source,
             status: status,
@@ -87,10 +89,10 @@ extension CodexBarCLI {
         output: CLIOutputPreferences? = nil,
         kind: CLIErrorKind = .runtime) -> Never
     {
-        if code != .success {
+        if self.shouldPrintExitError(code: code, message: message) {
             if let output, output.usesJSONOutput {
                 let payload = self.makeCLIErrorPayload(
-                    message: message ?? "Error",
+                    message: message ?? "",
                     code: code,
                     kind: kind,
                     pretty: output.pretty)
@@ -102,6 +104,10 @@ extension CodexBarCLI {
             }
         }
         platformExit(code.rawValue)
+    }
+
+    static func shouldPrintExitError(code: ExitCode, message: String?) -> Bool {
+        code != .success && message != nil
     }
 
     static func printError(_ error: Error, output: CLIOutputPreferences, kind: CLIErrorKind = .runtime) {

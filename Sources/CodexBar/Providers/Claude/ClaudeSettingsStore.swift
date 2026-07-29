@@ -10,6 +10,7 @@ extension SettingsStore {
         set {
             let source: ProviderSourceMode? = switch newValue {
             case .auto: .auto
+            case .api: .api
             case .oauth: .oauth
             case .web: .web
             case .cli: .cli
@@ -45,6 +46,52 @@ extension SettingsStore {
     }
 
     func ensureClaudeCookieLoaded() {}
+
+    var claudeAdminAPIKey: String {
+        get { self.configSnapshot.providerConfig(for: .claude)?.sanitizedAPIKey ?? "" }
+        set {
+            self.updateProviderConfig(provider: .claude) { entry in
+                entry.apiKey = self.normalizedConfigValue(newValue)
+            }
+            self.logSecretUpdate(provider: .claude, field: "apiKey", value: newValue)
+        }
+    }
+
+    var claudeSwapEnabled: Bool {
+        get { self.configSnapshot.providerConfig(for: .claude)?.claudeSwapEnabled ?? false }
+        set {
+            self.updateProviderConfig(provider: .claude) { entry in
+                entry.claudeSwapEnabled = newValue
+            }
+            self.logProviderModeChange(provider: .claude, field: "claudeSwapEnabled", value: String(newValue))
+        }
+    }
+
+    var claudeSwapShowSingleAccount: Bool {
+        get { self.configSnapshot.providerConfig(for: .claude)?.claudeSwapShowSingleAccount ?? false }
+        set {
+            self.updateProviderConfig(provider: .claude) { entry in
+                entry.claudeSwapShowSingleAccount = newValue
+            }
+            self.logProviderModeChange(
+                provider: .claude,
+                field: "claudeSwapShowSingleAccount",
+                value: String(newValue))
+        }
+    }
+
+    var claudeSwapExecutablePath: String {
+        get { self.configSnapshot.providerConfig(for: .claude)?.sanitizedClaudeSwapExecutablePath ?? "" }
+        set {
+            self.updateProviderConfig(provider: .claude) { entry in
+                entry.claudeSwapExecutablePath = self.normalizedConfigValue(newValue)
+            }
+            self.logProviderModeChange(
+                provider: .claude,
+                field: "claudeSwapExecutablePath",
+                value: newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "cleared" : "set")
+        }
+    }
 }
 
 extension SettingsStore {
@@ -58,14 +105,15 @@ extension SettingsStore {
             cookieSource: self.claudeSnapshotCookieSource(tokenOverride: tokenOverride, routing: routing),
             manualCookieHeader: self.claudeSnapshotCookieHeader(
                 routing: routing,
-                hasSelectedAccount: account != nil))
+                hasSelectedAccount: account != nil),
+            organizationID: account?.sanitizedOrganizationID)
     }
 
     private static func claudeUsageDataSource(from source: ProviderSourceMode?) -> ClaudeUsageDataSource {
         guard let source else { return .auto }
         switch source {
         case .auto, .api:
-            return .auto
+            return source == .api ? .api : .auto
         case .web:
             return .web
         case .cli:
@@ -84,6 +132,8 @@ extension SettingsStore {
             hasSelectedAccount ? "" : self.claudeCookieHeader
         case .oauth:
             ""
+        case .adminAPIKey:
+            ""
         case let .webCookie(header):
             header
         }
@@ -100,6 +150,9 @@ extension SettingsStore {
             return fallback
         }
         if routing.isOAuth {
+            return .off
+        }
+        if routing.adminAPIKey != nil {
             return .off
         }
         if self.tokenAccounts(for: .claude).isEmpty { return fallback }

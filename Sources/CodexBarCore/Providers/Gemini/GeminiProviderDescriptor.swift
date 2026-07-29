@@ -1,9 +1,8 @@
-import CodexBarMacroSupport
 import Foundation
 
-@ProviderDescriptorRegistration
-@ProviderDescriptorDefinition
 public enum GeminiProviderDescriptor {
+    public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
+
     static func makeDescriptor() -> ProviderDescriptor {
         ProviderDescriptor(
             id: .gemini,
@@ -22,13 +21,19 @@ public enum GeminiProviderDescriptor {
                 isPrimaryProvider: false,
                 usesAccountFallback: false,
                 dashboardURL: "https://gemini.google.com",
+                changelogURL: "https://github.com/google-gemini/gemini-cli/releases",
                 statusPageURL: nil,
                 statusLinkURL: "https://www.google.com/appsstatus/dashboard/products/npdyhgECDJ6tB66MxXyo/history",
                 statusWorkspaceProductID: "npdyhgECDJ6tB66MxXyo"),
             branding: ProviderBranding(
                 iconStyle: .gemini,
                 iconResourceName: "ProviderIcon-gemini",
-                color: ProviderColor(red: 171 / 255, green: 135 / 255, blue: 234 / 255)),
+                color: ProviderColor(red: 171 / 255, green: 135 / 255, blue: 234 / 255),
+                confettiPalette: [
+                    ProviderColor(hex: 0x4285F4),
+                    ProviderColor(hex: 0xA142F4),
+                    ProviderColor(hex: 0xD96570),
+                ]),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Gemini cost summary is not supported." }),
@@ -42,6 +47,8 @@ public enum GeminiProviderDescriptor {
 }
 
 struct GeminiStatusFetchStrategy: ProviderFetchStrategy {
+    static let sourceLabel = "oauth-api"
+
     let id: String = "gemini.api"
     let kind: ProviderFetchKind = .apiToken
 
@@ -54,7 +61,7 @@ struct GeminiStatusFetchStrategy: ProviderFetchStrategy {
         let snap = try await probe.fetch()
         return self.makeResult(
             usage: snap.toUsageSnapshot(),
-            sourceLabel: "api")
+            sourceLabel: Self.sourceLabel)
     }
 
     func shouldFallback(on _: Error, context _: ProviderFetchContext) -> Bool {

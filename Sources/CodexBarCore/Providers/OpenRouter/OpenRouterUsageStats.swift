@@ -45,11 +45,20 @@ public struct OpenRouterKeyData: Decodable, Sendable {
     public let limit: Double?
     /// Current usage
     public let usage: Double?
+    /// API key usage for the current UTC day.
+    public let usageDaily: Double?
+    /// API key usage for the current UTC week.
+    public let usageWeekly: Double?
+    /// API key usage for the current UTC month.
+    public let usageMonthly: Double?
 
     private enum CodingKeys: String, CodingKey {
         case rateLimit = "rate_limit"
         case limit
         case usage
+        case usageDaily = "usage_daily"
+        case usageWeekly = "usage_weekly"
+        case usageMonthly = "usage_monthly"
     }
 }
 
@@ -59,6 +68,11 @@ public struct OpenRouterRateLimit: Codable, Sendable {
     public let requests: Int
     /// Interval for the rate limit (e.g., "10s", "1m")
     public let interval: String
+
+    public init(requests: Int, interval: String) {
+        self.requests = requests
+        self.interval = interval
+    }
 }
 
 public enum OpenRouterKeyQuotaStatus: String, Codable, Sendable {
@@ -76,6 +90,9 @@ public struct OpenRouterUsageSnapshot: Codable, Sendable {
     public let keyDataFetched: Bool
     public let keyLimit: Double?
     public let keyUsage: Double?
+    public let keyUsageDaily: Double?
+    public let keyUsageWeekly: Double?
+    public let keyUsageMonthly: Double?
     public let rateLimit: OpenRouterRateLimit?
     public let updatedAt: Date
 
@@ -87,6 +104,9 @@ public struct OpenRouterUsageSnapshot: Codable, Sendable {
         keyDataFetched: Bool = false,
         keyLimit: Double? = nil,
         keyUsage: Double? = nil,
+        keyUsageDaily: Double? = nil,
+        keyUsageWeekly: Double? = nil,
+        keyUsageMonthly: Double? = nil,
         rateLimit: OpenRouterRateLimit?,
         updatedAt: Date)
     {
@@ -94,9 +114,13 @@ public struct OpenRouterUsageSnapshot: Codable, Sendable {
         self.totalUsage = totalUsage
         self.balance = balance
         self.usedPercent = usedPercent
-        self.keyDataFetched = keyDataFetched || keyLimit != nil || keyUsage != nil
+        self.keyDataFetched = keyDataFetched || keyLimit != nil || keyUsage != nil ||
+            keyUsageDaily != nil || keyUsageWeekly != nil || keyUsageMonthly != nil
         self.keyLimit = keyLimit
         self.keyUsage = keyUsage
+        self.keyUsageDaily = keyUsageDaily
+        self.keyUsageWeekly = keyUsageWeekly
+        self.keyUsageMonthly = keyUsageMonthly
         self.rateLimit = rateLimit
         self.updatedAt = updatedAt
     }
@@ -201,6 +225,7 @@ public struct OpenRouterUsageFetcher: Sendable {
         guard !apiKey.isEmpty else {
             throw OpenRouterUsageError.invalidCredentials
         }
+        try OpenRouterSettingsReader.validateEndpointOverrides(environment: environment)
 
         let baseURL = OpenRouterSettingsReader.apiURL(environment: environment)
         let creditsURL = baseURL.appendingPathComponent("credits")
@@ -216,21 +241,17 @@ public struct OpenRouterUsageFetcher: Sendable {
         let title = Self.sanitizedHeaderValue(environment[self.clientTitleEnvKey]) ?? Self.defaultClientTitle
         request.setValue(title, forHTTPHeaderField: "X-Title")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw OpenRouterUsageError.networkError("Invalid response")
-        }
-
-        guard httpResponse.statusCode == 200 else {
+        let response = try await ProviderHTTPClient.shared.response(for: request)
+        let data = response.data
+        guard response.statusCode == 200 else {
             let errorSummary = LogRedactor.redact(Self.sanitizedResponseBodySummary(data))
             if Self.debugFullErrorBodiesEnabled(environment: environment),
                let debugBody = Self.redactedDebugResponseBody(data)
             {
                 Self.log.debug("OpenRouter non-200 body (redacted): \(LogRedactor.redact(debugBody))")
             }
-            Self.log.error("OpenRouter API returned \(httpResponse.statusCode): \(errorSummary)")
-            throw OpenRouterUsageError.apiError("HTTP \(httpResponse.statusCode)")
+            Self.log.error("OpenRouter API returned \(response.statusCode): \(errorSummary)")
+            throw OpenRouterUsageError.apiError("HTTP \(response.statusCode)")
         }
 
         do {
@@ -239,7 +260,7 @@ public struct OpenRouterUsageFetcher: Sendable {
 
             // Optionally fetch key quota/rate-limit info from /key endpoint, but keep this bounded so
             // credits updates are not blocked by a slow or unavailable secondary endpoint.
-            let keyFetch = await fetchKeyData(
+            let keyFetch = try await fetchKeyData(
                 apiKey: apiKey,
                 baseURL: baseURL,
                 timeoutSeconds: Self.rateLimitTimeoutSeconds)
@@ -252,8 +273,13 @@ public struct OpenRouterUsageFetcher: Sendable {
                 keyDataFetched: keyFetch.fetched,
                 keyLimit: keyFetch.data?.limit,
                 keyUsage: keyFetch.data?.usage,
+                keyUsageDaily: keyFetch.data?.usageDaily,
+                keyUsageWeekly: keyFetch.data?.usageWeekly,
+                keyUsageMonthly: keyFetch.data?.usageMonthly,
                 rateLimit: keyFetch.data?.rateLimit,
                 updatedAt: Date())
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as DecodingError {
             Self.log.error("OpenRouter JSON decoding error: \(error.localizedDescription)")
             throw OpenRouterUsageError.parseFailed(error.localizedDescription)
@@ -274,37 +300,47 @@ public struct OpenRouterUsageFetcher: Sendable {
     private static func fetchKeyData(
         apiKey: String,
         baseURL: URL,
-        timeoutSeconds: TimeInterval) async -> OpenRouterKeyFetchResult
+        timeoutSeconds: TimeInterval) async throws -> OpenRouterKeyFetchResult
     {
         let timeout = max(0.1, timeoutSeconds)
-        let timeoutNanoseconds = UInt64(timeout * 1_000_000_000)
+        return try await self.boundedKeyFetch(timeout: .seconds(timeout)) {
+            await Self.fetchKeyDataRequest(
+                apiKey: apiKey,
+                baseURL: baseURL,
+                timeoutSeconds: timeout)
+        }
+    }
 
-        return await withTaskGroup(of: OpenRouterKeyFetchResult.self) { group in
-            group.addTask {
-                await Self.fetchKeyDataRequest(
-                    apiKey: apiKey,
-                    baseURL: baseURL,
-                    timeoutSeconds: timeout)
-            }
-            group.addTask {
-                do {
-                    try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                } catch {
-                    // Cancelled because the /key request finished first.
-                    return OpenRouterKeyFetchResult(data: nil, fetched: false)
-                }
-                guard !Task.isCancelled else {
-                    return OpenRouterKeyFetchResult(data: nil, fetched: false)
-                }
-                Self.log.debug("OpenRouter /key enrichment timed out after \(timeout)s")
-                return OpenRouterKeyFetchResult(data: nil, fetched: false)
-            }
+    static func _boundedKeyFetchForTesting(
+        timeout: Duration,
+        operation: @escaping @Sendable () async -> Void) async throws -> Bool
+    {
+        let result = try await self.boundedKeyFetch(timeout: timeout) {
+            await operation()
+            return OpenRouterKeyFetchResult(data: nil, fetched: true)
+        }
+        return result.fetched
+    }
 
-            let result = await group.next()
-            group.cancelAll()
-            if let result {
-                return result
-            }
+    private static func boundedKeyFetch(
+        timeout: Duration,
+        operation: @escaping @Sendable () async -> OpenRouterKeyFetchResult) async throws -> OpenRouterKeyFetchResult
+    {
+        let sourceTask = Task<OpenRouterKeyFetchResult, Error> {
+            await operation()
+        }
+        let race = BoundedTaskJoin(sourceTask: sourceTask)
+        switch await race.value(joinGrace: timeout) {
+        case let .value(result):
+            try Task.checkCancellation()
+            return result
+        case .timedOut:
+            try Task.checkCancellation()
+            Self.log.debug("OpenRouter /key enrichment timed out")
+            return OpenRouterKeyFetchResult(data: nil, fetched: false)
+        case .failure:
+            sourceTask.cancel()
+            try Task.checkCancellation()
             return OpenRouterKeyFetchResult(data: nil, fetched: false)
         }
     }
@@ -323,16 +359,13 @@ public struct OpenRouterUsageFetcher: Sendable {
         request.timeoutInterval = timeoutSeconds
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200
-            else {
+            let response = try await ProviderHTTPClient.shared.response(for: request)
+            guard response.statusCode == 200 else {
                 return OpenRouterKeyFetchResult(data: nil, fetched: false)
             }
 
             let decoder = JSONDecoder()
-            let keyResponse = try decoder.decode(OpenRouterKeyResponse.self, from: data)
+            let keyResponse = try decoder.decode(OpenRouterKeyResponse.self, from: response.data)
             return OpenRouterKeyFetchResult(data: keyResponse.data, fetched: true)
         } catch {
             Self.log.debug("Failed to fetch OpenRouter /key enrichment: \(error.localizedDescription)")

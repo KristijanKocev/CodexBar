@@ -2,6 +2,13 @@ import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 
 public struct GeminiModelQuota: Sendable {
     public let modelId: String
@@ -43,11 +50,14 @@ public struct GeminiStatusSnapshot: Sendable {
         let flashMin = flashQuotas.min(by: { $0.percentLeft < $1.percentLeft })
         let proMin = proQuotas.min(by: { $0.percentLeft < $1.percentLeft })
 
-        let primary = RateWindow(
-            usedPercent: proMin.map { 100 - $0.percentLeft } ?? 0,
-            windowMinutes: 1440,
-            resetsAt: proMin?.resetTime,
-            resetDescription: proMin?.resetDescription)
+        // Keep missing tiers nil so downstream selectors can fall back to a quota the account actually reports.
+        let primary: RateWindow? = proMin.map {
+            RateWindow(
+                usedPercent: 100 - $0.percentLeft,
+                windowMinutes: 1440,
+                resetsAt: $0.resetTime,
+                resetDescription: $0.resetDescription)
+        }
 
         let secondary: RateWindow? = flashMin.map {
             RateWindow(
@@ -94,6 +104,7 @@ public enum GeminiStatusProbeError: LocalizedError, Sendable, Equatable {
     case geminiNotInstalled
     case notLoggedIn
     case unsupportedAuthType(String)
+    case consumerTierDeprecated
     case parseFailed(String)
     case timedOut
     case apiError(String)
@@ -106,6 +117,8 @@ public enum GeminiStatusProbeError: LocalizedError, Sendable, Equatable {
             "Not logged in to Gemini. Run 'gemini' in Terminal to authenticate."
         case let .unsupportedAuthType(authType):
             "Gemini \(authType) auth not supported. Use Google account (OAuth) instead."
+        case .consumerTierDeprecated:
+            GeminiConsumerTierMigration.deprecationError
         case let .parseFailed(msg):
             "Could not parse Gemini usage: \(msg)"
         case .timedOut:
@@ -114,11 +127,38 @@ public enum GeminiStatusProbeError: LocalizedError, Sendable, Equatable {
             "Gemini API error: \(msg)"
         }
     }
+
+    /// Detects Google's consumer-tier Gemini CLI shutdown responses.
+    public static func isConsumerTierDeprecationSignal(_ text: String) -> Bool {
+        let normalized = text.lowercased()
+        if normalized.contains("unsupported_client") {
+            return true
+        }
+        if normalized.contains("ineligibletiererror") {
+            return true
+        }
+        if normalized.contains("no longer supported"), normalized.contains("gemini code assist") {
+            return true
+        }
+        if normalized.contains("migrate"), normalized.contains("antigravity"), normalized.contains("gemini") {
+            return true
+        }
+        return false
+    }
+
+    public static func throwIfConsumerTierDeprecated(data: Data) throws {
+        guard let text = String(data: data, encoding: .utf8),
+              isConsumerTierDeprecationSignal(text)
+        else {
+            return
+        }
+        throw GeminiStatusProbeError.consumerTierDeprecated
+    }
 }
 
 public enum GeminiAuthType: String, Sendable {
     case oauthPersonal = "oauth-personal"
-    case apiKey = "api-key"
+    case apiKey = "gemini-api-key"
     case vertexAI = "vertex-ai"
     case unknown
 }
@@ -146,9 +186,7 @@ public struct GeminiStatusProbe: Sendable {
     public init(
         timeout: TimeInterval = 10.0,
         homeDirectory: String = NSHomeDirectory(),
-        dataLoader: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse) = { request in
-            try await URLSession.shared.data(for: request)
-        })
+        dataLoader: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse) = Self.defaultDataLoader)
     {
         self.timeout = timeout
         self.homeDirectory = homeDirectory
@@ -168,6 +206,9 @@ public struct GeminiStatusProbe: Sendable {
             return .unknown
         }
 
+        if selectedType == "api-key" {
+            return .apiKey
+        }
         return GeminiAuthType(rawValue: selectedType) ?? .unknown
     }
 
@@ -212,34 +253,39 @@ public struct GeminiStatusProbe: Sendable {
             "now": "\(Date())",
         ])
 
-        guard let storedAccessToken = creds.accessToken, !storedAccessToken.isEmpty else {
-            Self.log.error("No access token found")
-            throw GeminiStatusProbeError.notLoggedIn
-        }
+        var accessToken = creds.accessToken?.isEmpty == false ? creds.accessToken : nil
+        var idToken = creds.idToken
+        let needsRefresh = accessToken == nil || creds.expiryDate.map { $0 < Date() } == true
+        if needsRefresh {
+            if accessToken == nil {
+                Self.log.info("No access token found; attempting refresh from stored Gemini credentials")
+            } else if let expiry = creds.expiryDate {
+                Self.log.info("Token expired; attempting refresh", metadata: [
+                    "expiry": "\(expiry)",
+                ])
+            }
 
-        var accessToken = storedAccessToken
-        if let expiry = creds.expiryDate, expiry < Date() {
-            Self.log.info("Token expired; attempting refresh", metadata: [
-                "expiry": "\(expiry)",
-            ])
-
-            guard let refreshToken = creds.refreshToken else {
+            guard let refreshToken = creds.refreshToken, !refreshToken.isEmpty else {
                 Self.log.error("No refresh token available")
                 throw GeminiStatusProbeError.notLoggedIn
             }
-
             accessToken = try await Self.refreshAccessToken(
                 refreshToken: refreshToken,
                 timeout: timeout,
                 homeDirectory: homeDirectory,
                 dataLoader: dataLoader)
+            idToken = (try? Self.loadCredentials(homeDirectory: homeDirectory).idToken) ?? idToken
+        }
+        guard let accessToken else {
+            Self.log.error("No access token found")
+            throw GeminiStatusProbeError.notLoggedIn
         }
 
         // Extract account info from JWT
-        let claims = Self.extractClaimsFromToken(creds.idToken)
+        let claims = Self.extractClaimsFromToken(idToken)
 
         // Load Code Assist status to get project ID and tier (aligned with CLI setupUser logic)
-        let caStatus = await Self.loadCodeAssistStatus(
+        let caStatus = try await Self.loadCodeAssistStatus(
             accessToken: accessToken,
             timeout: timeout,
             dataLoader: dataLoader)
@@ -280,34 +326,21 @@ public struct GeminiStatusProbe: Sendable {
         }
 
         if httpResponse.statusCode == 401 {
+            try GeminiStatusProbeError.throwIfConsumerTierDeprecated(data: data)
             throw GeminiStatusProbeError.notLoggedIn
         }
 
         guard httpResponse.statusCode == 200 else {
+            try GeminiStatusProbeError.throwIfConsumerTierDeprecated(data: data)
             throw GeminiStatusProbeError.apiError("HTTP \(httpResponse.statusCode)")
         }
 
         let snapshot = try Self.parseAPIResponse(data, email: claims.email)
 
-        // Plan display strings with tier mapping:
-        // - standard-tier: Paid subscription (AI Pro, AI Ultra, Code Assist
-        //   Standard/Enterprise, Developer Program Premium)
-        // - free-tier + hd claim: Workspace account (Gemini included free since Jan 2025)
-        // - free-tier: Personal free account (1000 req/day limit)
-        // - legacy-tier: Unknown legacy/grandfathered tier
-        // - nil (API failed): Leave blank (no display)
-        let plan: String? = switch (caStatus.tier, claims.hostedDomain) {
-        case (.standard, _):
-            "Paid"
-        case let (.free, .some(domain)):
-            { Self.log.info("Workspace account detected", metadata: ["domain": domain]); return "Workspace" }()
-        case (.free, .none):
-            { Self.log.info("Personal free account"); return "Free" }()
-        case (.legacy, _):
-            "Legacy"
-        case (.none, _):
-            { Self.log.info("Tier detection failed, leaving plan blank"); return nil }()
-        }
+        let plan = Self.resolveAccountPlan(
+            tier: caStatus.tier,
+            hostedDomain: claims.hostedDomain,
+            paidTierName: caStatus.paidTierName)
 
         return GeminiStatusSnapshot(
             modelQuotas: snapshot.modelQuotas,
@@ -363,14 +396,16 @@ public struct GeminiStatusProbe: Sendable {
     private struct CodeAssistStatus {
         let tier: GeminiUserTierId?
         let projectId: String?
+        let paidTierName: String?
 
-        static let empty = CodeAssistStatus(tier: nil, projectId: nil)
+        static let empty = CodeAssistStatus(tier: nil, projectId: nil, paidTierName: nil)
     }
 
     private static func loadCodeAssistStatus(
         accessToken: String,
         timeout: TimeInterval,
-        dataLoader: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse)) async -> CodeAssistStatus
+        dataLoader: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse)) async throws
+        -> CodeAssistStatus
     {
         guard let url = URL(string: loadCodeAssistEndpoint) else {
             self.log.warning("loadCodeAssist: invalid endpoint URL")
@@ -399,6 +434,7 @@ public struct GeminiStatusProbe: Sendable {
         }
 
         guard httpResponse.statusCode == 200 else {
+            try GeminiStatusProbeError.throwIfConsumerTierDeprecated(data: data)
             Self.log.warning("loadCodeAssist: HTTP error", metadata: [
                 "statusCode": "\(httpResponse.statusCode)",
                 "body": String(data: data, encoding: .utf8) ?? "<binary>",
@@ -434,20 +470,26 @@ public struct GeminiStatusProbe: Sendable {
         }
 
         let tierId = (json["currentTier"] as? [String: Any])?["id"] as? String
+        let paidTierName = Self.parsePaidTierName(from: json)
+
         guard let tierId else {
             Self.log.warning("loadCodeAssist: no currentTier.id in response", metadata: [
                 "json": "\(json)",
             ])
-            return CodeAssistStatus(tier: nil, projectId: projectId)
+            return CodeAssistStatus(tier: nil, projectId: projectId, paidTierName: paidTierName)
         }
 
         guard let tier = GeminiUserTierId(rawValue: tierId) else {
             Self.log.warning("loadCodeAssist: unknown tier ID", metadata: ["tierId": tierId])
-            return CodeAssistStatus(tier: nil, projectId: projectId)
+            return CodeAssistStatus(tier: nil, projectId: projectId, paidTierName: paidTierName)
         }
 
-        Self.log.info("loadCodeAssist: success", metadata: ["tier": tierId, "projectId": projectId ?? "nil"])
-        return CodeAssistStatus(tier: tier, projectId: projectId)
+        Self.log.info("loadCodeAssist: success", metadata: [
+            "tier": tierId,
+            "projectId": projectId ?? "nil",
+            "paidTierName": paidTierName ?? "nil",
+        ])
+        return CodeAssistStatus(tier: tier, projectId: projectId, paidTierName: paidTierName)
     }
 
     private struct OAuthCredentials {
@@ -457,55 +499,31 @@ public struct GeminiStatusProbe: Sendable {
         let expiryDate: Date?
     }
 
-    private struct OAuthClientCredentials {
+    fileprivate struct OAuthClientCredentials {
         let clientId: String
         let clientSecret: String
-    }
-
-    private static func extractOAuthCredentials() -> OAuthClientCredentials? {
-        let env = ProcessInfo.processInfo.environment
-
-        // Find the gemini binary
-        guard let geminiPath = BinaryLocator.resolveGeminiBinary(
-            env: env,
-            loginPATH: LoginShellPathCache.shared.current)
-            ?? TTYCommandRunner.which("gemini")
-        else {
-            return nil
-        }
-
-        // Resolve symlinks to find the actual installation
-        let resolvedGeminiPath = URL(fileURLWithPath: geminiPath).resolvingSymlinksInPath().path
-
-        // Try the legacy layouts first — they're cheap file reads and cover the common cases
-        // (Homebrew, npm/bun sibling, Nix) without spawning subprocesses or walking the tree.
-        if let credentials = Self.extractOAuthCredentialsFromLegacyPaths(realGeminiPath: resolvedGeminiPath) {
-            return credentials
-        }
-
-        // For fnm-managed installs, ask fnm where the package lives
-        if Self.isLikelyFnmManagedPath(geminiPath) || Self.isLikelyFnmManagedPath(resolvedGeminiPath),
-           let fnmPath = TTYCommandRunner.which("fnm"),
-           let packageRoot = Self.resolveGeminiPackageRootViaFnm(fnmPath: fnmPath, environment: env),
-           let credentials = Self.extractOAuthCredentials(fromGeminiPackageRoot: packageRoot)
-        {
-            return credentials
-        }
-
-        // Fall back to walking up the directory tree from the binary
-        if let packageRoot = Self.findGeminiPackageRoot(startingAt: resolvedGeminiPath),
-           let credentials = Self.extractOAuthCredentials(fromGeminiPackageRoot: packageRoot)
-        {
-            return credentials
-        }
-
-        return nil
     }
 
     private static func isLikelyFnmManagedPath(_ path: String) -> Bool {
         let normalized = path.replacingOccurrences(of: "\\", with: "/")
         return normalized.contains("/fnm_multishells/")
             || (normalized.contains("/node-versions/") && normalized.contains("/fnm/"))
+    }
+
+    private static func resolveExecutableOnEnvironmentPath(
+        named executable: String,
+        environment: [String: String]) -> String?
+    {
+        guard let path = environment["PATH"] else { return nil }
+        for directory in path.split(separator: ":") where !directory.isEmpty {
+            let candidate = URL(fileURLWithPath: String(directory), isDirectory: true)
+                .appendingPathComponent(executable)
+                .path
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+        return nil
     }
 
     private static func resolveGeminiPackageRootViaFnm(
@@ -566,61 +584,6 @@ public struct GeminiStatusProbe: Sendable {
         return nil
     }
 
-    private static func runProcess(
-        executable: String,
-        arguments: [String],
-        environment: [String: String],
-        timeout: TimeInterval) -> String?
-    {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-
-        var mergedEnvironment = environment
-        mergedEnvironment["PATH"] = PathBuilder.effectivePATH(
-            purposes: [.tty, .nodeTooling],
-            env: environment,
-            loginPATH: LoginShellPathCache.shared.current)
-        process.environment = mergedEnvironment
-
-        let stdout = Pipe()
-        process.standardOutput = stdout
-        process.standardError = Pipe()
-        process.standardInput = nil
-
-        let exitSemaphore = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in
-            exitSemaphore.signal()
-        }
-
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-
-        let didExit = exitSemaphore.wait(timeout: .now() + timeout) == .success
-        if !didExit {
-            if process.isRunning {
-                process.terminate()
-                _ = exitSemaphore.wait(timeout: .now() + 0.5)
-            }
-            return nil
-        }
-
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
-        guard process.terminationStatus == 0,
-              let output = String(data: data, encoding: .utf8)?
-                  .trimmingCharacters(in: .whitespacesAndNewlines),
-                  !output.isEmpty
-        else {
-            return nil
-        }
-
-        return output.components(separatedBy: .newlines).first?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
     private static func findGeminiPackageRoot(startingAt path: String) -> String? {
         let fileManager = FileManager.default
         var currentURL = URL(fileURLWithPath: path).standardizedFileURL
@@ -656,6 +619,22 @@ public struct GeminiStatusProbe: Sendable {
                json["name"] as? String == "@google/gemini-cli"
             {
                 return globalPackageJSONURL.deletingLastPathComponent().path
+            }
+
+            // Homebrew layout:
+            // <cellar-version>/libexec/lib/node_modules/@google/gemini-cli/package.json
+            let homebrewPackageJSONURL = currentURL
+                .appendingPathComponent("libexec")
+                .appendingPathComponent("lib")
+                .appendingPathComponent("node_modules")
+                .appendingPathComponent("@google")
+                .appendingPathComponent("gemini-cli")
+                .appendingPathComponent("package.json")
+            if let data = try? Data(contentsOf: homebrewPackageJSONURL),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               json["name"] as? String == "@google/gemini-cli"
+            {
+                return homebrewPackageJSONURL.deletingLastPathComponent().path
             }
 
             let parentURL = currentURL.deletingLastPathComponent()
@@ -720,6 +699,21 @@ public struct GeminiStatusProbe: Sendable {
             }
         }
 
+        guard let bundleFiles = try? FileManager.default.contentsOfDirectory(
+            at: bundleRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles])
+        else {
+            return nil
+        }
+
+        for url in bundleFiles where url.pathExtension == "js" && !visitedPaths.contains(url.standardizedFileURL.path) {
+            guard let content = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            if let credentials = Self.parseOAuthCredentials(from: content) {
+                return credentials
+            }
+        }
+
         return nil
     }
 
@@ -780,9 +774,9 @@ public struct GeminiStatusProbe: Sendable {
     }
 
     private static func parseOAuthCredentials(from content: String) -> OAuthClientCredentials? {
-        // Match: const OAUTH_CLIENT_ID = '...';
-        let clientIdPattern = #"OAUTH_CLIENT_ID\s*=\s*['"]([\w\-\.]+)['"]\s*;"#
-        let secretPattern = #"OAUTH_CLIENT_SECRET\s*=\s*['"]([\w\-]+)['"]\s*;"#
+        // Match: const/let/var OAUTH_CLIENT_ID = '...';
+        let clientIdPattern = #"(?:const|let|var)?\s*OAUTH_CLIENT_ID\s*=\s*['"]([\w\-\.]+)['"]\s*;"#
+        let secretPattern = #"(?:const|let|var)?\s*OAUTH_CLIENT_SECRET\s*=\s*['"]([\w\-]+)['"]\s*;"#
 
         guard let clientIdRegex = try? NSRegularExpression(pattern: clientIdPattern),
               let secretRegex = try? NSRegularExpression(pattern: secretPattern)
@@ -824,7 +818,7 @@ public struct GeminiStatusProbe: Sendable {
 
         guard let oauthCreds = Self.extractOAuthCredentials() else {
             Self.log.error("Could not extract OAuth credentials from Gemini CLI")
-            throw GeminiStatusProbeError.apiError("Could not find Gemini CLI OAuth configuration")
+            throw GeminiStatusProbeError.apiError(GeminiConsumerTierMigration.oauthRecoveryError)
         }
 
         let body = [
@@ -842,6 +836,7 @@ public struct GeminiStatusProbe: Sendable {
         }
 
         guard httpResponse.statusCode == 200 else {
+            try GeminiStatusProbeError.throwIfConsumerTierDeprecated(data: data)
             Self.log.error("Token refresh failed", metadata: [
                 "statusCode": "\(httpResponse.statusCode)",
             ])
@@ -1095,5 +1090,308 @@ public struct GeminiStatusProbe: Sendable {
         }
 
         return quotas
+    }
+}
+
+extension GeminiStatusProbe {
+    fileprivate static func extractOAuthCredentials() -> OAuthClientCredentials? {
+        if let resolved = GeminiOAuthConfig.environmentClient() {
+            return OAuthClientCredentials(clientId: resolved.clientID, clientSecret: resolved.clientSecret)
+        }
+        if let path = GeminiOAuthConfig.configuredOAuth2JSPath,
+           let credentials = Self.parseOAuthCredentials(fromFile: path)
+        {
+            return credentials
+        }
+        if let credentials = Self.discoverOAuthCredentialsFromInstalledCLI() {
+            return OAuthClientCredentials(clientId: credentials.clientID, clientSecret: credentials.clientSecret)
+        }
+        if let credentials = Self.discoverOAuthCredentialsFromKnownInstallPaths() {
+            return credentials
+        }
+        return nil
+    }
+
+    /// Optional Homebrew/npm prefixes for last-resort discovery when the gemini
+    /// binary cannot be resolved (GUI PATH / sandbox). Tests inject fake Cellar trees.
+    @TaskLocal public static var knownInstallPrefixesForTesting: [String]?
+
+    fileprivate static func discoverOAuthCredentialsFromKnownInstallPaths() -> OAuthClientCredentials? {
+        let oauthFile = "dist/src/code_assist/oauth2.js"
+        let nestedOAuthFile =
+            "node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/\(oauthFile)"
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+
+        // When tests inject Homebrew prefixes, skip the hard-coded host paths so
+        // fixture Cellar trees are not shadowed by the developer's real install.
+        if Self.knownInstallPrefixesForTesting == nil {
+            let possiblePaths = [
+                "/opt/homebrew/lib/node_modules/@google/gemini-cli-core/\(oauthFile)",
+                "/opt/homebrew/lib/\(nestedOAuthFile)",
+                "/usr/local/lib/node_modules/@google/gemini-cli-core/\(oauthFile)",
+                "/usr/local/lib/\(nestedOAuthFile)",
+                "\(home)/.npm-global/lib/node_modules/@google/gemini-cli-core/\(oauthFile)",
+                "\(home)/.npm-global/lib/\(nestedOAuthFile)",
+            ]
+
+            for path in possiblePaths {
+                if let credentials = Self.parseOAuthCredentials(fromFile: path) {
+                    return credentials
+                }
+            }
+        }
+
+        // Homebrew Cellar/opt libexec layouts keep credentials inside the package
+        // bundle when GUI PATH cannot resolve `/opt/homebrew/bin/gemini`.
+        for packageRoot in Self.knownHomebrewGeminiPackageRoots() {
+            if let credentials = Self.extractOAuthCredentials(fromGeminiPackageRoot: packageRoot) {
+                return credentials
+            }
+        }
+        return nil
+    }
+
+    fileprivate static func knownHomebrewPrefixes() -> [String] {
+        if let overrides = self.knownInstallPrefixesForTesting, !overrides.isEmpty {
+            return overrides
+        }
+        return ["/opt/homebrew", "/usr/local"]
+    }
+
+    fileprivate static func knownHomebrewGeminiPackageRoots(
+        fileManager: FileManager = .default) -> [String]
+    {
+        var roots: [String] = []
+        var seen = Set<String>()
+
+        func appendPackageRoot(under prefixRoot: String) {
+            let packageRoot = URL(fileURLWithPath: prefixRoot)
+                .appendingPathComponent("libexec")
+                .appendingPathComponent("lib")
+                .appendingPathComponent("node_modules")
+                .appendingPathComponent("@google")
+                .appendingPathComponent("gemini-cli")
+                .path
+            guard fileManager.fileExists(atPath: packageRoot),
+                  seen.insert(packageRoot).inserted
+            else {
+                return
+            }
+            roots.append(packageRoot)
+        }
+
+        for prefix in Self.knownHomebrewPrefixes() {
+            let optRoot = "\(prefix)/opt/gemini-cli"
+            if fileManager.fileExists(atPath: optRoot) {
+                appendPackageRoot(under: optRoot)
+            }
+
+            let cellarRoot = "\(prefix)/Cellar/gemini-cli"
+            guard let versions = try? fileManager.contentsOfDirectory(atPath: cellarRoot) else {
+                continue
+            }
+            for version in versions.sorted() {
+                appendPackageRoot(under: "\(cellarRoot)/\(version)")
+            }
+        }
+
+        return roots
+    }
+
+    fileprivate static func parseOAuthCredentials(fromFile path: String) -> OAuthClientCredentials? {
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return nil
+        }
+        return Self.parseOAuthCredentials(from: content)
+    }
+
+    fileprivate static func discoverOAuthCredentialsFromInstalledCLI() -> GeminiOAuthConfig.ClientCredentials? {
+        let env = ProcessInfo.processInfo.environment
+
+        guard let geminiPath = BinaryLocator.resolveGeminiBinary(
+            env: env,
+            loginPATH: LoginShellPathCache.shared.current)
+            ?? TTYCommandRunner.which("gemini")
+        else {
+            return nil
+        }
+
+        let resolvedGeminiPath = URL(fileURLWithPath: geminiPath).resolvingSymlinksInPath().path
+
+        if let credentials = Self.extractOAuthCredentialsFromLegacyPaths(realGeminiPath: resolvedGeminiPath) {
+            return GeminiOAuthConfig.ClientCredentials(
+                clientID: credentials.clientId,
+                clientSecret: credentials.clientSecret)
+        }
+
+        if Self.isLikelyFnmManagedPath(geminiPath) || Self.isLikelyFnmManagedPath(resolvedGeminiPath),
+           let fnmPath = Self.resolveExecutableOnEnvironmentPath(named: "fnm", environment: env)
+           ?? TTYCommandRunner.which("fnm"),
+           let packageRoot = Self.resolveGeminiPackageRootViaFnm(fnmPath: fnmPath, environment: env),
+           let credentials = Self.extractOAuthCredentials(fromGeminiPackageRoot: packageRoot)
+        {
+            return GeminiOAuthConfig.ClientCredentials(
+                clientID: credentials.clientId,
+                clientSecret: credentials.clientSecret)
+        }
+
+        if let packageRoot = Self.findGeminiPackageRoot(startingAt: resolvedGeminiPath),
+           let credentials = Self.extractOAuthCredentials(fromGeminiPackageRoot: packageRoot)
+        {
+            return GeminiOAuthConfig.ClientCredentials(
+                clientID: credentials.clientId,
+                clientSecret: credentials.clientSecret)
+        }
+
+        return nil
+    }
+
+    /// Plan display strings with tier mapping:
+    /// - paidTier.name: Most-specific paid subscription label from Google, regardless of currentTier
+    /// - standard-tier: Paid subscription fallback (Code Assist Standard/Enterprise, Developer Program Premium)
+    /// - free-tier + hd claim: Workspace account (Gemini included free since Jan 2025)
+    /// - free-tier: Personal free account
+    /// - legacy-tier: Unknown legacy/grandfathered tier
+    /// - nil (API failed): Leave blank (no display)
+    fileprivate static func resolveAccountPlan(
+        tier: GeminiUserTierId?,
+        hostedDomain: String?,
+        paidTierName: String?) -> String?
+    {
+        // Match Gemini CLI's contract: a named paid tier is the most specific plan signal,
+        // even when currentTier is missing, unknown, or still reports free-tier.
+        if let paidTierName {
+            self.log.info("Paid tier detected", metadata: [
+                "tier": tier?.rawValue ?? "unknown",
+                "plan": paidTierName,
+            ])
+            return paidTierName
+        }
+
+        switch (tier, hostedDomain) {
+        case (.standard, _):
+            return "Paid"
+        case let (.free, .some(domain)):
+            Self.log.info("Workspace account detected", metadata: ["domain": domain])
+            return "Workspace"
+        case (.free, .none):
+            Self.log.info("Personal free account")
+            return "Free"
+        case (.legacy, _):
+            return "Legacy"
+        case (.none, _):
+            self.log.info("Tier detection failed, leaving plan blank")
+            return nil
+        }
+    }
+
+    private static func parsePaidTierName(from json: [String: Any]) -> String? {
+        guard let paidTier = json["paidTier"] as? [String: Any],
+              let rawName = paidTier["name"] as? String
+        else {
+            return nil
+        }
+        let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+extension GeminiStatusProbe {
+    private static let processTimeoutQueue = DispatchQueue(
+        label: "com.steipete.codexbar.gemini-process-timeout",
+        qos: .utility,
+        attributes: .concurrent)
+
+    package static func runProcess(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        timeout: TimeInterval) -> String?
+    {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+
+        var mergedEnvironment = environment
+        mergedEnvironment["PATH"] = PathBuilder.effectivePATH(
+            purposes: [.tty, .nodeTooling],
+            env: environment,
+            loginPATH: LoginShellPathCache.shared.current)
+        process.environment = mergedEnvironment
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        process.standardInput = nil
+
+        let stdoutCapture = ProcessPipeCapture(pipe: stdout)
+        let stderrCapture = ProcessPipeCapture(pipe: stderr)
+
+        do {
+            try process.run()
+        } catch {
+            stdoutCapture.stop()
+            stdout.fileHandleForWriting.closeFile()
+            stderrCapture.stop()
+            stderr.fileHandleForWriting.closeFile()
+            return nil
+        }
+        // Process has duplicated these descriptors. Closing the parent's copies lets readers observe EOF as
+        // soon as the helper exits instead of spending the full drain grace period on every successful call.
+        stdout.fileHandleForWriting.closeFile()
+        stderr.fileHandleForWriting.closeFile()
+        stdoutCapture.start()
+        stderrCapture.start()
+        let pid = process.processIdentifier
+        let processGroup: pid_t? = setpgid(pid, pid) == 0 ? pid : nil
+
+        // Wait synchronously for Foundation to reap the helper. A separate timer owns timeout termination,
+        // so neither termination-handler scheduling nor stale Process.isRunning state controls normal exits.
+        let timeoutState = GeminiProcessTimeoutState()
+        let timeoutTimer = DispatchSource.makeTimerSource(queue: Self.processTimeoutQueue)
+        timeoutTimer.schedule(deadline: .now() + max(0, timeout))
+        timeoutTimer.setEventHandler {
+            guard process.isRunning else { return }
+            timeoutState.markTimedOut()
+            SubprocessRunner.terminateProcess(process, processGroup: processGroup)
+        }
+        timeoutTimer.resume()
+        process.waitUntilExit()
+        timeoutTimer.cancel()
+
+        if timeoutState.didTimeOut {
+            stdoutCapture.stop()
+            stderrCapture.stop()
+            return nil
+        }
+
+        let data = stdoutCapture.finishFirstLineSynchronously(timeout: 1)
+        stderrCapture.stop()
+        let output = ProcessPipeCapture.decodeUTF8(data)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard process.terminationStatus == 0, !output.isEmpty else {
+            return nil
+        }
+
+        return output.components(separatedBy: .newlines).first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+private final class GeminiProcessTimeoutState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var timedOut = false
+
+    var didTimeOut: Bool {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+        return self.timedOut
+    }
+
+    func markTimedOut() {
+        self.lock.lock()
+        self.timedOut = true
+        self.lock.unlock()
     }
 }

@@ -43,10 +43,13 @@ struct MenuContent: View {
             switch style {
             case .headline:
                 Text(text).font(.headline)
+                    .accessibilityLabel(text)
             case .primary:
                 Text(text)
+                    .accessibilityLabel(text)
             case .secondary:
                 Text(text).foregroundStyle(.secondary).font(.footnote)
+                    .accessibilityLabel(text)
             }
         case let .action(title, action):
             Button {
@@ -60,11 +63,18 @@ struct MenuContent: View {
                         Text(title)
                     }
                     .foregroundStyle(.primary)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(title)
                 } else {
                     Text(title)
+                        .accessibilityLabel(title)
                 }
             }
             .buttonStyle(.plain)
+        case let .unavailable(title, tooltip):
+            Text(title)
+                .foregroundStyle(.secondary)
+                .help(tooltip ?? "")
         case let .submenu(title, systemImageName, submenuItems):
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
@@ -73,6 +83,8 @@ struct MenuContent: View {
                     }
                     Text(title).font(.headline)
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(title)
                 ForEach(Array(submenuItems.enumerated()), id: \.offset) { _, submenuItem in
                     HStack(spacing: 8) {
                         if submenuItem.isChecked {
@@ -85,6 +97,8 @@ struct MenuContent: View {
                         Text(submenuItem.title)
                             .foregroundStyle(submenuItem.isEnabled ? .primary : .secondary)
                     }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(submenuItem.title)
                 }
             }
         case .divider:
@@ -108,10 +122,14 @@ struct MenuContent: View {
             self.actions.openDashboard()
         case .statusPage:
             self.actions.openStatusPage()
+        case .changelog:
+            self.actions.openChangelog()
         case .addCodexAccount:
             self.actions.addCodexAccount()
         case .requestCodexSystemPromotion:
             return
+        case let .addProviderAccount(provider):
+            self.actions.switchAccount(provider)
         case let .switchAccount(provider):
             self.actions.switchAccount(provider)
         case let .openTerminal(command):
@@ -128,6 +146,8 @@ struct MenuContent: View {
             self.actions.quit()
         case let .copyError(message):
             self.actions.copyError(message)
+        case .focusAgentSession:
+            return
         }
     }
 }
@@ -138,6 +158,7 @@ struct MenuActions {
     let refreshAugmentSession: () -> Void
     let openDashboard: () -> Void
     let openStatusPage: () -> Void
+    let openChangelog: () -> Void
     let addCodexAccount: () -> Void
     let switchAccount: (UsageProvider) -> Void
     let openTerminal: (String) -> Void
@@ -145,6 +166,38 @@ struct MenuActions {
     let openAbout: () -> Void
     let quit: () -> Void
     let copyError: (String) -> Void
+}
+
+struct PersistentRefreshRowMetrics: Equatable {
+    static let defaults = Self(
+        rowHeight: 24,
+        selectionHorizontalInset: 5,
+        selectionVerticalInset: 0,
+        selectionCornerRadius: 7,
+        // Align the custom row's image/title frames with native NSMenuItem columns.
+        leadingPadding: 15,
+        trailingPadding: 8,
+        iconWidth: 16,
+        iconSymbolPointSize: 16,
+        iconSymbolWeight: .regular,
+        iconTitleSpacing: 4.5,
+        shortcutFontSize: 13,
+        shortcutXOffset: -9.5,
+        shortcutYOffset: 0)
+
+    let rowHeight: CGFloat
+    let selectionHorizontalInset: CGFloat
+    let selectionVerticalInset: CGFloat
+    let selectionCornerRadius: CGFloat
+    let leadingPadding: CGFloat
+    let trailingPadding: CGFloat
+    let iconWidth: CGFloat
+    let iconSymbolPointSize: CGFloat
+    let iconSymbolWeight: NSFont.Weight
+    let iconTitleSpacing: CGFloat
+    let shortcutFontSize: CGFloat
+    let shortcutXOffset: CGFloat
+    let shortcutYOffset: CGFloat
 }
 
 @MainActor
@@ -156,22 +209,51 @@ struct StatusIconView: View {
         Image(nsImage: self.icon)
             .renderingMode(.template)
             .interpolation(.none)
+            .accessibilityLabel(self.accessibilityLabel)
+            .accessibilityValue(self.accessibilityValue)
+    }
+
+    private var accessibilityLabel: String {
+        let descriptor = ProviderDescriptorRegistry.descriptor(for: self.provider)
+        return descriptor.metadata.displayName
+    }
+
+    private var accessibilityValue: String {
+        let snapshot = self.store.snapshot(for: self.provider)
+        guard let snap = snapshot else {
+            return L("No data")
+        }
+        let remaining = IconRemainingResolver.resolvedRemaining(
+            snapshot: snap,
+            style: self.store.style(for: self.provider))
+        let primary = remaining.primary
+        let percent = primary.map(Self.accessibilityPercentRemaining) ?? L("Unknown")
+        let stale = self.store.isStale(provider: self.provider)
+        return stale ? "\(percent), \(L("stale data"))" : percent
+    }
+
+    static func accessibilityPercentRemaining(_ remaining: Double) -> String {
+        String(format: L("%d percent remaining"), Int(remaining.rounded()))
     }
 
     private var icon: NSImage {
+        let now = Date()
         let snapshot = self.store.snapshot(for: self.provider)
         let remaining = snapshot.map {
-            IconRemainingResolver.resolvedRemaining(snapshot: $0, style: self.store.style(for: self.provider))
+            IconRemainingResolver.resolvedRemaining(
+                snapshot: $0,
+                style: self.store.style(for: self.provider),
+                now: now)
         }
         let creditsProjection = self.store.codexConsumerProjectionIfNeeded(
             for: self.provider,
             surface: .menuBar,
             snapshotOverride: snapshot,
-            now: snapshot?.updatedAt ?? Date())
+            now: now)
         let creditsRemaining = creditsProjection?.menuBarFallback == .creditsBalance
             ? self.store.codexMenuBarCreditsRemaining(
                 snapshotOverride: snapshot,
-                now: snapshot?.updatedAt ?? Date())
+                now: now)
             : nil
         return IconRenderer.makeIcon(
             primaryRemaining: remaining?.primary,
@@ -179,6 +261,7 @@ struct StatusIconView: View {
             creditsRemaining: creditsRemaining,
             stale: self.store.isStale(provider: self.provider),
             style: self.store.style(for: self.provider),
-            statusIndicator: self.store.statusIndicator(for: self.provider))
+            statusIndicator: self.store.statusIndicator(for: self.provider),
+            hideCritters: self.store.settings.menuBarHidesCritters)
     }
 }

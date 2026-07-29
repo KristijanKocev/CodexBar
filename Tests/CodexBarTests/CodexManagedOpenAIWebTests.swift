@@ -304,7 +304,7 @@ struct CodexManagedOpenAIWebTests {
         }
 
         var observedTargetEmail: String?
-        store._test_openAIDashboardLoaderOverride = { accountEmail, _, _ in
+        store._test_openAIDashboardLoaderOverride = { accountEmail, _, _, _ in
             observedTargetEmail = accountEmail
             return OpenAIDashboardSnapshot(
                 signedInEmail: "new@example.com",
@@ -365,7 +365,7 @@ struct CodexManagedOpenAIWebTests {
         store.lastSourceLabels[.codex] = "codex-cli"
 
         var observedTargetEmail: String?
-        store._test_openAIDashboardLoaderOverride = { accountEmail, _, _ in
+        store._test_openAIDashboardLoaderOverride = { accountEmail, _, _, _ in
             observedTargetEmail = accountEmail
             return OpenAIDashboardSnapshot(
                 signedInEmail: "usage@example.com",
@@ -818,7 +818,7 @@ struct CodexManagedOpenAIWebTests {
             startupBehavior: .testing)
 
         var loaderCalls = 0
-        store._test_openAIDashboardLoaderOverride = { _, _, _ in
+        store._test_openAIDashboardLoaderOverride = { _, _, _, _ in
             loaderCalls += 1
             throw OpenAIDashboardFetcher.FetchError.loginRequired
         }
@@ -837,6 +837,45 @@ struct CodexManagedOpenAIWebTests {
             store.lastOpenAIDashboardError ==
                 "OpenAI cookies are for rdsarna@gmail.com, not ratulsarna@gmail.com. " +
                 "Switch chatgpt.com account, then refresh OpenAI cookies.")
+        #expect(store.openAIDashboard == nil)
+    }
+
+    @Test
+    func `managed codex refresh reports no matching web session without fake account`() async {
+        let settings = self.makeSettingsStore(suite: "CodexManagedOpenAIWebTests-no-matching-web-session")
+        let managedAccount = ManagedCodexAccount(
+            id: UUID(),
+            email: "ratulsarna@gmail.com",
+            managedHomePath: "/tmp/managed-codex-home",
+            createdAt: 1,
+            updatedAt: 1,
+            lastAuthenticatedAt: 1)
+        settings._test_activeManagedCodexAccount = managedAccount
+        settings.codexActiveSource = .managedAccount(id: managedAccount.id)
+        defer { settings._test_activeManagedCodexAccount = nil }
+
+        let store = UsageStore(
+            fetcher: UsageFetcher(environment: [:]),
+            browserDetection: BrowserDetection(cacheTTL: 0),
+            settings: settings,
+            startupBehavior: .testing)
+
+        store._test_openAIDashboardLoaderOverride = { _, _, _, _ in
+            throw OpenAIDashboardFetcher.FetchError.loginRequired
+        }
+        defer { store._test_openAIDashboardLoaderOverride = nil }
+        store._test_openAIDashboardCookieImportOverride = { _, _, _, _, _ in
+            throw OpenAIDashboardBrowserCookieImporter.ImportError.noMatchingAccount(found: [])
+        }
+        defer { store._test_openAIDashboardCookieImportOverride = nil }
+
+        let expectedGuard = store.currentCodexOpenAIWebRefreshGuard()
+        await store.refreshOpenAIDashboardIfNeeded(force: true, expectedGuard: expectedGuard)
+
+        #expect(
+            store.lastOpenAIDashboardError ==
+                "No matching OpenAI web session found for ratulsarna@gmail.com. " +
+                "Sign in to chatgpt.com as ratulsarna@gmail.com, then refresh OpenAI cookies.")
         #expect(store.openAIDashboard == nil)
     }
 }

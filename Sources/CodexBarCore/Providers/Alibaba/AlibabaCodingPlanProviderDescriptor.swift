@@ -1,13 +1,12 @@
-import CodexBarMacroSupport
 import Foundation
 
 #if os(macOS)
 import SweetCookieKit
 #endif
 
-@ProviderDescriptorRegistration
-@ProviderDescriptorDefinition
 public enum AlibabaCodingPlanProviderDescriptor {
+    public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
+
     static func makeDescriptor() -> ProviderDescriptor {
         #if os(macOS)
         let browserOrder: BrowserCookieImportOrder = [
@@ -46,10 +45,16 @@ public enum AlibabaCodingPlanProviderDescriptor {
             branding: ProviderBranding(
                 iconStyle: .alibaba,
                 iconResourceName: "ProviderIcon-alibaba",
-                color: ProviderColor(red: 1.0, green: 106 / 255, blue: 0)),
+                color: ProviderColor(red: 1.0, green: 106 / 255, blue: 0),
+                confettiPalette: [
+                    ProviderColor(hex: 0xFF6A00),
+                    ProviderColor(hex: 0x111111),
+                    ProviderColor(hex: 0xFFFFFF),
+                ]),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Alibaba Coding Plan cost summary is not supported." }),
+            pace: .calendarMonthResetWindow,
             fetchPlan: ProviderFetchPlan(
                 sourceModes: [.auto, .web, .api],
                 pipeline: ProviderFetchPipeline(resolveStrategies: self.resolveStrategies)),
@@ -184,6 +189,8 @@ struct AlibabaCodingPlanWebFetchStrategy: ProviderFetchStrategy {
             return true
         case .invalidCredentials:
             return true
+        case .apiKeyUnavailableInRegion:
+            return false
         case let .apiError(message):
             return message.contains("HTTP 404") || message.contains("HTTP 403")
         case .networkError:

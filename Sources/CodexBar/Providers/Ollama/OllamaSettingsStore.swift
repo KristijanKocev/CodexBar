@@ -2,6 +2,29 @@ import CodexBarCore
 import Foundation
 
 extension SettingsStore {
+    var ollamaUsageDataSource: ProviderSourceMode {
+        get {
+            let source = self.configSnapshot.providerConfig(for: .ollama)?.source
+            return source ?? .auto
+        }
+        set {
+            self.updateProviderConfig(provider: .ollama) { entry in
+                entry.source = newValue == .auto ? nil : newValue
+            }
+            self.logProviderModeChange(provider: .ollama, field: "source", value: newValue.rawValue)
+        }
+    }
+
+    var ollamaAPIToken: String {
+        get { self.configSnapshot.providerConfig(for: .ollama)?.sanitizedAPIKey ?? "" }
+        set {
+            self.updateProviderConfig(provider: .ollama) { entry in
+                entry.apiKey = self.normalizedConfigValue(newValue)
+            }
+            self.logSecretUpdate(provider: .ollama, field: "apiKey", value: newValue)
+        }
+    }
+
     var ollamaCookieHeader: String {
         get { self.configSnapshot.providerConfig(for: .ollama)?.sanitizedCookieHeader ?? "" }
         set {
@@ -22,42 +45,18 @@ extension SettingsStore {
         }
     }
 
+    func ensureOllamaAPITokenLoaded() {}
+
     func ensureOllamaCookieLoaded() {}
 }
 
 extension SettingsStore {
     func ollamaSettingsSnapshot(tokenOverride: TokenAccountOverride?) -> ProviderSettingsSnapshot
     .OllamaProviderSettings {
-        ProviderSettingsSnapshot.OllamaProviderSettings(
-            cookieSource: self.ollamaSnapshotCookieSource(tokenOverride: tokenOverride),
-            manualCookieHeader: self.ollamaSnapshotCookieHeader(tokenOverride: tokenOverride))
-    }
-
-    private func ollamaSnapshotCookieHeader(tokenOverride: TokenAccountOverride?) -> String {
-        let fallback = self.ollamaCookieHeader
-        guard let support = TokenAccountSupportCatalog.support(for: .ollama),
-              case .cookieHeader = support.injection
-        else {
-            return fallback
-        }
-        guard let account = ProviderTokenAccountSelection.selectedAccount(
+        self.resolvedCookieSettings(
             provider: .ollama,
-            settings: self,
-            override: tokenOverride)
-        else {
-            return fallback
-        }
-        return TokenAccountSupportCatalog.normalizedCookieHeader(account.token, support: support)
-    }
-
-    private func ollamaSnapshotCookieSource(tokenOverride: TokenAccountOverride?) -> ProviderCookieSource {
-        let fallback = self.ollamaCookieSource
-        guard let support = TokenAccountSupportCatalog.support(for: .ollama),
-              support.requiresManualCookieSource
-        else {
-            return fallback
-        }
-        if self.tokenAccounts(for: .ollama).isEmpty { return fallback }
-        return .manual
+            configuredSource: self.ollamaCookieSource,
+            configuredHeader: self.ollamaCookieHeader,
+            tokenOverride: tokenOverride)
     }
 }

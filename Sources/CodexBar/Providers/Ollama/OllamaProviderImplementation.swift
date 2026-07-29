@@ -1,17 +1,34 @@
 import AppKit
 import CodexBarCore
-import CodexBarMacroSupport
 import Foundation
 import SwiftUI
 
-@ProviderImplementationRegistration
 struct OllamaProviderImplementation: ProviderImplementation {
     let id: UsageProvider = .ollama
 
     @MainActor
     func observeSettings(_ settings: SettingsStore) {
+        _ = settings.ollamaUsageDataSource
+        _ = settings.ollamaAPIToken
         _ = settings.ollamaCookieSource
         _ = settings.ollamaCookieHeader
+    }
+
+    @MainActor
+    func sourceMode(context: ProviderSourceModeContext) -> ProviderSourceMode {
+        context.settings.ollamaUsageDataSource
+    }
+
+    @MainActor
+    func isAvailable(context: ProviderAvailabilityContext) -> Bool {
+        if OllamaAPISettingsReader.apiKey(environment: context.environment) != nil {
+            return true
+        }
+        context.settings.ensureOllamaAPITokenLoaded()
+        if !context.settings.ollamaAPIToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return true
+        }
+        return context.settings.ollamaCookieSource != .off
     }
 
     @MainActor
@@ -35,6 +52,16 @@ struct OllamaProviderImplementation: ProviderImplementation {
 
     @MainActor
     func settingsPickers(context: ProviderSettingsContext) -> [ProviderSettingsPickerDescriptor] {
+        let sourceBinding = Binding(
+            get: { context.settings.ollamaUsageDataSource.rawValue },
+            set: { raw in
+                context.settings.ollamaUsageDataSource = ProviderSourceMode(rawValue: raw) ?? .auto
+            })
+        let sourceOptions: [ProviderSettingsPickerOption] = [
+            ProviderSettingsPickerOption(id: ProviderSourceMode.auto.rawValue, title: "Auto"),
+            ProviderSettingsPickerOption(id: ProviderSourceMode.web.rawValue, title: "Browser cookies"),
+            ProviderSettingsPickerOption(id: ProviderSourceMode.api.rawValue, title: "API key"),
+        ]
         let cookieBinding = Binding(
             get: { context.settings.ollamaCookieSource.rawValue },
             set: { raw in
@@ -55,6 +82,14 @@ struct OllamaProviderImplementation: ProviderImplementation {
 
         return [
             ProviderSettingsPickerDescriptor(
+                id: "ollama-usage-source",
+                title: "Usage source",
+                subtitle: "API key verifies Ollama Cloud access; cookies still expose quota limits.",
+                binding: sourceBinding,
+                options: sourceOptions,
+                isVisible: nil,
+                onChange: nil),
+            ProviderSettingsPickerDescriptor(
                 id: "ollama-cookie-source",
                 title: "Cookie source",
                 subtitle: "Automatic imports browser cookies.",
@@ -62,13 +97,48 @@ struct OllamaProviderImplementation: ProviderImplementation {
                 binding: cookieBinding,
                 options: cookieOptions,
                 isVisible: nil,
-                onChange: nil),
+                onChange: nil,
+                trailingText: {
+                    guard context.settings.ollamaUsageDataSource != .api else { return nil }
+                    return ProviderCookieRefreshAction.trailingText(
+                        provider: .ollama,
+                        cookieSource: context.settings.ollamaCookieSource,
+                        context: context)
+                },
+                trailingActions: [
+                    ProviderCookieRefreshAction.descriptor(
+                        provider: .ollama,
+                        cookieSource: { context.settings.ollamaCookieSource },
+                        additionalVisibility: { context.settings.ollamaUsageDataSource != .api },
+                        context: context),
+                ]),
         ]
     }
 
     @MainActor
     func settingsFields(context: ProviderSettingsContext) -> [ProviderSettingsFieldDescriptor] {
         [
+            ProviderSettingsFieldDescriptor(
+                id: "ollama-api-key",
+                title: "API key",
+                subtitle: "Stored in ~/.codexbar/config.json. Get your key from Ollama settings.",
+                kind: .secure,
+                placeholder: "ollama-...",
+                binding: context.stringBinding(\.ollamaAPIToken),
+                actions: [
+                    ProviderSettingsActionDescriptor(
+                        id: "ollama-open-api-keys",
+                        title: "Open Ollama API Keys",
+                        style: .link,
+                        isVisible: nil,
+                        perform: {
+                            if let url = URL(string: "https://ollama.com/settings/keys") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }),
+                ],
+                isVisible: nil,
+                onActivate: { context.settings.ensureOllamaAPITokenLoaded() }),
             ProviderSettingsFieldDescriptor(
                 id: "ollama-cookie",
                 title: "",

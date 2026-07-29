@@ -1,13 +1,12 @@
-import CodexBarMacroSupport
 import Foundation
 
 #if os(macOS)
 import SweetCookieKit
 #endif
 
-@ProviderDescriptorRegistration
-@ProviderDescriptorDefinition
 public enum AugmentProviderDescriptor {
+    public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
+
     static func makeDescriptor() -> ProviderDescriptor {
         #if os(macOS)
         // Custom browser order that includes Chrome Beta and other variants
@@ -47,12 +46,16 @@ public enum AugmentProviderDescriptor {
                 usesAccountFallback: false,
                 browserCookieOrder: browserOrder,
                 dashboardURL: "https://app.augmentcode.com/account/subscription",
-                statusPageURL: nil,
-                statusLinkURL: nil),
+                statusPageURL: "https://status.augmentcode.com"),
             branding: ProviderBranding(
                 iconStyle: .augment,
                 iconResourceName: "ProviderIcon-augment",
-                color: ProviderColor(red: 99 / 255, green: 102 / 255, blue: 241 / 255)),
+                color: ProviderColor(red: 99 / 255, green: 102 / 255, blue: 241 / 255),
+                confettiPalette: [
+                    ProviderColor(hex: 0xF97316),
+                    ProviderColor(hex: 0x111111),
+                    ProviderColor(hex: 0xFFF7ED),
+                ]),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Augment cost summary is not supported." }),
@@ -95,10 +98,8 @@ struct AugmentCLIFetchStrategy: ProviderFetchStrategy {
         // Fallback to web if CLI fails (not authenticated, etc.)
         if let cliError = error as? AuggieCLIError {
             switch cliError {
-            case .notAuthenticated, .noOutput:
+            case .notAuthenticated, .noOutput, .parseError:
                 return true
-            case .parseError:
-                return false // Don't fallback on parse errors - something is wrong
             }
         }
         return true

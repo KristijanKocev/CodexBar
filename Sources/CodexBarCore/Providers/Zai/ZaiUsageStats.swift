@@ -18,6 +18,32 @@ public enum ZaiLimitUnit: Int, Sendable {
     case weeks = 6
 }
 
+public enum ZaiUsageScope: String, CaseIterable, Codable, Sendable {
+    case personal
+    case team
+}
+
+public struct ZaiBigModelTeamContext: Equatable, Sendable {
+    public let organizationID: String
+    public let projectID: String
+
+    public init?(organizationID: String?, projectID: String?) {
+        guard let organizationID = ZaiSettingsReader.cleaned(organizationID),
+              let projectID = ZaiSettingsReader.cleaned(projectID)
+        else {
+            return nil
+        }
+        self.organizationID = organizationID
+        self.projectID = projectID
+    }
+
+    public init?(environment: [String: String] = ProcessInfo.processInfo.environment) {
+        self.init(
+            organizationID: environment[ZaiSettingsReader.bigModelOrganizationKey],
+            projectID: environment[ZaiSettingsReader.bigModelProjectKey])
+    }
+}
+
 /// A single limit entry from the z.ai API
 public struct ZaiLimitEntry: Sendable {
     public let type: ZaiLimitType
@@ -58,7 +84,9 @@ extension ZaiLimitEntry {
         if let computed = self.computedUsedPercent {
             return computed
         }
-        return self.percentage
+        // The raw API percentage can fall outside 0...100 (z.ai omits/misreports quota fields);
+        // clamp it like computedUsedPercent and every sibling provider instead of surfacing it raw.
+        return min(100, max(0, self.percentage))
     }
 
     public var windowMinutes: Int? {
@@ -94,6 +122,10 @@ extension ZaiLimitEntry {
     public var windowLabel: String? {
         guard let description = self.windowDescription else { return nil }
         return "\(description) window"
+    }
+
+    var isMCPMonthlyMarker: Bool {
+        self.type == .timeLimit && self.unit == .minutes && self.number == 1
     }
 
     private var computedUsedPercent: Double? {
@@ -137,6 +169,7 @@ public struct ZaiUsageSnapshot: Sendable {
     public let sessionTokenLimit: ZaiLimitEntry?
     public let timeLimit: ZaiLimitEntry?
     public let planName: String?
+    public let modelUsage: ZaiModelUsageData?
     public let updatedAt: Date
 
     public init(
@@ -144,12 +177,14 @@ public struct ZaiUsageSnapshot: Sendable {
         sessionTokenLimit: ZaiLimitEntry? = nil,
         timeLimit: ZaiLimitEntry?,
         planName: String?,
+        modelUsage: ZaiModelUsageData? = nil,
         updatedAt: Date)
     {
         self.tokenLimit = tokenLimit
         self.sessionTokenLimit = sessionTokenLimit
         self.timeLimit = timeLimit
         self.planName = planName
+        self.modelUsage = modelUsage
         self.updatedAt = updatedAt
     }
 
@@ -197,6 +232,9 @@ extension ZaiUsageSnapshot {
     }
 
     private static func resetDescription(for limit: ZaiLimitEntry) -> String? {
+        if limit.isMCPMonthlyMarker {
+            return "Monthly"
+        }
         if let label = limit.windowLabel {
             return label
         }
@@ -210,12 +248,18 @@ extension ZaiUsageSnapshot {
 /// Z.ai quota limit API response
 private struct ZaiQuotaLimitResponse: Decodable {
     let code: Int
-    let msg: String
+    let msg: String?
     let data: ZaiQuotaLimitData?
     let success: Bool
 
     var isSuccess: Bool {
         self.success && self.code == 200
+    }
+
+    var errorMessage: String {
+        let message = self.msg?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let message, !message.isEmpty { return message }
+        return "Z.ai quota API returned code \(self.code)"
     }
 }
 
@@ -299,33 +343,57 @@ public struct ZaiUsageFetcher: Sendable {
         return region.quotaLimitURL
     }
 
+    /// Resolves the canonical dashboard for the effective quota endpoint without opening custom override hosts.
+    public static func resolveDashboardURL(
+        region: ZaiAPIRegion,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        usageScope: ZaiUsageScope = .personal) -> URL
+    {
+        let quotaHost = self.resolveQuotaURL(region: region, environment: environment).host?.lowercased()
+        if quotaHost == ZaiAPIRegion.global.quotaLimitURL.host?.lowercased() {
+            return usageScope == .team ? ZaiAPIRegion.global.teamDashboardURL : ZaiAPIRegion.global.dashboardURL
+        }
+        if quotaHost == ZaiAPIRegion.bigmodelCN.quotaLimitURL.host?.lowercased() {
+            return usageScope == .team ? ZaiAPIRegion.bigmodelCN.teamDashboardURL : ZaiAPIRegion.bigmodelCN.dashboardURL
+        }
+        return usageScope == .team ? region.teamDashboardURL : region.dashboardURL
+    }
+
     /// Fetches usage stats from z.ai using the provided API key
     public static func fetchUsage(
         apiKey: String,
         region: ZaiAPIRegion = .global,
-        environment: [String: String] = ProcessInfo.processInfo.environment) async throws -> ZaiUsageSnapshot
+        usageScope: ZaiUsageScope? = nil,
+        teamContext: ZaiBigModelTeamContext? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        transport: any ProviderHTTPTransport = ProviderHTTPClient.shared) async throws -> ZaiUsageSnapshot
     {
         guard !apiKey.isEmpty else {
             throw ZaiUsageError.invalidCredentials
         }
+        try ZaiSettingsReader.validateQuotaEndpointOverride(environment: environment)
 
-        let quotaURL = self.resolveQuotaURL(region: region, environment: environment)
+        let resolvedScope = usageScope ?? .personal
+        let quotaURL = try self.requestURL(
+            baseURL: self.resolveQuotaURL(region: region, environment: environment),
+            usageScope: resolvedScope)
+        let resolvedTeamContext = try self.resolvedTeamContext(
+            usageScope: resolvedScope,
+            explicit: teamContext,
+            environment: environment)
 
         var request = URLRequest(url: quotaURL)
         request.httpMethod = "GET"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "authorization")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "accept")
+        self.applyTeamHeaders(resolvedTeamContext, to: &request)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw ZaiUsageError.networkError("Invalid response")
-        }
-
-        guard httpResponse.statusCode == 200 else {
+        let response = try await transport.response(for: request)
+        let data = response.data
+        guard response.statusCode == 200 else {
             let errorMessage = String(data: data, encoding: .utf8) ?? "Unknown error"
-            Self.log.error("z.ai API returned \(httpResponse.statusCode): \(errorMessage)")
-            throw ZaiUsageError.apiError("HTTP \(httpResponse.statusCode): \(errorMessage)")
+            Self.log.error("z.ai API returned \(response.statusCode): \(errorMessage)")
+            throw ZaiUsageError.apiError("HTTP \(response.statusCode): \(errorMessage)")
         }
 
         // Some upstream issues (wrong endpoint/region/proxy) can yield HTTP 200 with an empty body.
@@ -361,6 +429,38 @@ public struct ZaiUsageFetcher: Sendable {
         return "\(host)\(port)\(path)"
     }
 
+    private static func requestURL(baseURL: URL, usageScope: ZaiUsageScope) throws -> URL {
+        guard usageScope == .team else { return baseURL }
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw ZaiUsageError.networkError("Invalid URL")
+        }
+        var items = components.queryItems ?? []
+        items.removeAll { $0.name == "type" }
+        items.append(URLQueryItem(name: "type", value: "2"))
+        components.queryItems = items
+        guard let url = components.url else {
+            throw ZaiUsageError.networkError("Invalid URL")
+        }
+        return url
+    }
+
+    private static func resolvedTeamContext(
+        usageScope: ZaiUsageScope,
+        explicit: ZaiBigModelTeamContext?,
+        environment: [String: String]) throws -> ZaiBigModelTeamContext?
+    {
+        guard usageScope == .team else { return nil }
+        if let explicit { return explicit }
+        if let context = ZaiBigModelTeamContext(environment: environment) { return context }
+        throw ZaiUsageError.missingTeamContext
+    }
+
+    private static func applyTeamHeaders(_ context: ZaiBigModelTeamContext?, to request: inout URLRequest) {
+        guard let context else { return }
+        request.setValue(context.organizationID, forHTTPHeaderField: "Bigmodel-Organization")
+        request.setValue(context.projectID, forHTTPHeaderField: "Bigmodel-Project")
+    }
+
     static func parseUsageSnapshot(from data: Data) throws -> ZaiUsageSnapshot {
         guard !data.isEmpty else {
             throw ZaiUsageError.parseFailed("Empty response body")
@@ -370,7 +470,7 @@ public struct ZaiUsageFetcher: Sendable {
         let apiResponse = try decoder.decode(ZaiQuotaLimitResponse.self, from: data)
 
         guard apiResponse.isSuccess else {
-            throw ZaiUsageError.apiError(apiResponse.msg)
+            throw ZaiUsageError.apiError(apiResponse.errorMessage)
         }
 
         guard let responseData = apiResponse.data else {
@@ -411,29 +511,320 @@ public struct ZaiUsageFetcher: Sendable {
             sessionTokenLimit: sessionTokenLimit,
             timeLimit: timeLimit,
             planName: responseData.planName,
+            modelUsage: nil,
             updatedAt: Date())
     }
 
     private static func quotaURL(baseURLString: String) -> URL? {
         guard let cleaned = ZaiSettingsReader.cleaned(baseURLString) else { return nil }
-
-        if let url = URL(string: cleaned), url.scheme != nil {
-            if url.path.isEmpty || url.path == "/" {
-                return url.appendingPathComponent(Self.quotaAPIPath)
-            }
-            return url
+        guard let url = ProviderEndpointOverrideValidator.normalizedHTTPSURL(from: cleaned) else { return nil }
+        if url.path.isEmpty || url.path == "/" {
+            return url.appendingPathComponent(Self.quotaAPIPath)
         }
-        guard let base = URL(string: "https://\(cleaned)") else { return nil }
-        if base.path.isEmpty || base.path == "/" {
-            return base.appendingPathComponent(Self.quotaAPIPath)
-        }
-        return base
+        return url
     }
+}
+
+// MARK: - Model Usage Data
+
+/// Per-model hourly token usage from the z.ai model-usage API
+public struct ZaiModelUsageData: Sendable {
+    public let xTime: [String]
+    public let modelDataList: [ZaiModelDataItem]
+
+    public init(xTime: [String], modelDataList: [ZaiModelDataItem]) {
+        self.xTime = xTime
+        self.modelDataList = modelDataList
+    }
+
+    public var modelNames: [String] {
+        self.modelDataList.compactMap(\.modelName)
+    }
+}
+
+public struct ZaiModelDataItem: Sendable {
+    public let modelName: String?
+    public let tokensUsage: [Int?]
+
+    public init(modelName: String?, tokensUsage: [Int?]) {
+        self.modelName = modelName
+        self.tokensUsage = tokensUsage
+    }
+}
+
+// MARK: - Hourly Chart Data
+
+public enum ZaiHourlyRange: Equatable, Sendable {
+    case today(referenceDate: Date)
+    case last24h
+
+    public var isToday: Bool {
+        if case .today = self { return true }
+        return false
+    }
+}
+
+public struct ZaiHourlyBar: Sendable {
+    public let label: String
+    public let segments: [(model: String, tokens: Int)]
+
+    public init(label: String, segments: [(model: String, tokens: Int)]) {
+        self.label = label
+        self.segments = segments
+    }
+
+    public var totalTokens: Int {
+        self.segments.reduce(0) { $0 + $1.tokens }
+    }
+}
+
+public enum ZaiHourlyBars: Sendable {
+    public static func from(modelData: ZaiModelUsageData, range: ZaiHourlyRange, now: Date = Date()) -> [ZaiHourlyBar] {
+        let calendar = Calendar.current
+        let referenceDate: Date = switch range {
+        case let .today(ref): ref
+        case .last24h: now
+        }
+
+        let todayStart = calendar.startOfDay(for: referenceDate)
+        let cutoff: Date = switch range {
+        case .today: todayStart
+        case .last24h: calendar.date(byAdding: .hour, value: -24, to: now) ?? now
+        }
+
+        var bars: [ZaiHourlyBar] = []
+        for (index, timeString) in modelData.xTime.enumerated() {
+            guard let hourDate = parseHourDate(timeString) else { continue }
+
+            if hourDate < cutoff { continue }
+
+            var segments: [(model: String, tokens: Int)] = []
+            for item in modelData.modelDataList {
+                guard index < item.tokensUsage.count,
+                      let tokenCount = item.tokensUsage[index], tokenCount > 0
+                else { continue }
+                segments.append((model: item.modelName ?? "Unknown", tokens: tokenCount))
+            }
+
+            let total = segments.reduce(0) { $0 + $1.tokens }
+            guard total > 0 else { continue }
+
+            let label = self.formatHourLabel(hourDate: hourDate)
+            bars.append(ZaiHourlyBar(label: label, segments: segments))
+        }
+
+        return bars
+    }
+
+    public static func parseHourDate(_ string: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter.date(from: string)
+    }
+
+    private static func formatHourLabel(hourDate: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter.string(from: hourDate)
+    }
+}
+
+// MARK: - Model Usage Fetcher Extension
+
+extension ZaiUsageFetcher {
+    /// Fetches hourly model usage data for the last 24 hours
+    public static func fetchModelUsage(
+        apiKey: String,
+        region: ZaiAPIRegion = .global,
+        usageScope: ZaiUsageScope? = nil,
+        teamContext: ZaiBigModelTeamContext? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        transport: any ProviderHTTPTransport = ProviderHTTPClient.shared) async throws -> ZaiModelUsageData
+    {
+        guard !apiKey.isEmpty else {
+            throw ZaiUsageError.invalidCredentials
+        }
+        try ZaiSettingsReader.validateAPIHostEndpointOverride(environment: environment)
+
+        let resolvedScope = usageScope ?? .personal
+        let resolvedTeamContext = try self.resolvedTeamContext(
+            usageScope: resolvedScope,
+            explicit: teamContext,
+            environment: environment)
+
+        let baseURL: URL = if let host = ZaiSettingsReader.apiHost(environment: environment),
+                              let resolved = Self.modelUsageURL(baseURLString: host)
+        {
+            resolved
+        } else {
+            region.modelUsageURL
+        }
+
+        let now = Date()
+        let calendar = Calendar.current
+        guard let startDate = calendar.date(byAdding: .day, value: -1, to: calendar.startOfDay(for: now)) else {
+            throw ZaiUsageError.parseFailed("Invalid date calculation")
+        }
+
+        let startComponents = calendar.dateComponents([.year, .month, .day, .hour], from: startDate)
+        let endComponents = calendar.dateComponents([.year, .month, .day, .hour], from: now)
+        let startTime = String(
+            format: "%04d-%02d-%02d %02d:00:00",
+            startComponents.year!,
+            startComponents.month!,
+            startComponents.day!,
+            startComponents.hour!)
+        let endTime = String(
+            format: "%04d-%02d-%02d %02d:59:59",
+            endComponents.year!,
+            endComponents.month!,
+            endComponents.day!,
+            endComponents.hour!)
+
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw ZaiUsageError.networkError("Invalid URL")
+        }
+        components.queryItems = [
+            URLQueryItem(name: "startTime", value: startTime),
+            URLQueryItem(name: "endTime", value: endTime),
+        ]
+        if resolvedScope == .team {
+            components.queryItems?.append(URLQueryItem(name: "type", value: "3"))
+        }
+
+        guard let requestURL = components.url else {
+            throw ZaiUsageError.networkError("Invalid URL")
+        }
+
+        var request = URLRequest(url: requestURL)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        self.applyTeamHeaders(resolvedTeamContext, to: &request)
+
+        let response = try await transport.response(for: request)
+        let data = response.data
+        guard response.statusCode == 200 else {
+            let errorMessage = String(data: data, encoding: .utf8) ?? "Unknown error"
+            Self.log.error("z.ai model-usage API returned \(response.statusCode): \(errorMessage)")
+            throw ZaiUsageError.apiError("HTTP \(response.statusCode): \(errorMessage)")
+        }
+
+        guard !data.isEmpty else { return ZaiModelUsageData(xTime: [], modelDataList: []) }
+
+        return try Self.parseModelUsage(from: data)
+    }
+
+    static func parseModelUsage(from data: Data) throws -> ZaiModelUsageData {
+        let decoder = JSONDecoder()
+        let apiResponse = try decoder.decode(ZaiModelUsageAPIResponse.self, from: data)
+
+        guard apiResponse.isSuccess else {
+            throw ZaiUsageError.apiError(apiResponse.msg)
+        }
+
+        guard let responseData = apiResponse.data else {
+            return ZaiModelUsageData(xTime: [], modelDataList: [])
+        }
+
+        let items = responseData.modelDataList?.map { raw in
+            ZaiModelDataItem(
+                modelName: raw.modelName,
+                tokensUsage: raw.tokensUsage ?? [])
+        } ?? []
+
+        return ZaiModelUsageData(
+            xTime: responseData.xTime ?? [],
+            modelDataList: items)
+    }
+
+    /// Fetches required quota data and attaches optional model usage when available.
+    public static func fetchUsageWithModelUsage(
+        apiKey: String,
+        region: ZaiAPIRegion = .global,
+        usageScope: ZaiUsageScope? = nil,
+        teamContext: ZaiBigModelTeamContext? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        transport: any ProviderHTTPTransport = ProviderHTTPClient.shared) async throws -> ZaiUsageSnapshot
+    {
+        try ZaiSettingsReader.validateEndpointOverrides(environment: environment)
+        let snapshot = try await Self.fetchUsage(
+            apiKey: apiKey,
+            region: region,
+            usageScope: usageScope,
+            teamContext: teamContext,
+            environment: environment,
+            transport: transport)
+        let modelUsage: ZaiModelUsageData?
+        do {
+            modelUsage = try await Self.fetchModelUsage(
+                apiKey: apiKey,
+                region: region,
+                usageScope: usageScope,
+                teamContext: teamContext,
+                environment: environment,
+                transport: transport)
+        } catch {
+            Self.log.info("z.ai model usage fetch failed (non-fatal): \(error.localizedDescription)")
+            modelUsage = nil
+        }
+
+        guard modelUsage != nil else { return snapshot }
+
+        return ZaiUsageSnapshot(
+            tokenLimit: snapshot.tokenLimit,
+            sessionTokenLimit: snapshot.sessionTokenLimit,
+            timeLimit: snapshot.timeLimit,
+            planName: snapshot.planName,
+            modelUsage: modelUsage,
+            updatedAt: snapshot.updatedAt)
+    }
+
+    private static func modelUsageURL(baseURLString: String) -> URL? {
+        guard let cleaned = ZaiSettingsReader.cleaned(baseURLString) else { return nil }
+        let path = "api/monitor/usage/model-usage"
+        guard let url = ProviderEndpointOverrideValidator.normalizedHTTPSURL(from: cleaned) else { return nil }
+        if url.path.isEmpty || url.path == "/" {
+            return url.appendingPathComponent(path)
+        }
+        return url
+    }
+}
+
+// MARK: - Model Usage API Response (private)
+
+private struct ZaiModelUsageAPIResponse: Decodable {
+    let code: Int
+    let msg: String
+    let data: ZaiModelUsageRawData?
+    let success: Bool
+
+    var isSuccess: Bool {
+        self.success && self.code == 200
+    }
+}
+
+private struct ZaiModelUsageRawData: Decodable {
+    let xTime: [String]?
+    let modelDataList: [ZaiModelDataItemRaw]?
+
+    enum CodingKeys: String, CodingKey {
+        case xTime = "x_time"
+        case modelDataList
+    }
+}
+
+private struct ZaiModelDataItemRaw: Decodable {
+    let modelName: String?
+    let tokensUsage: [Int?]?
 }
 
 /// Errors that can occur during z.ai usage fetching
 public enum ZaiUsageError: LocalizedError, Sendable {
     case invalidCredentials
+    case missingTeamContext
     case networkError(String)
     case apiError(String)
     case parseFailed(String)
@@ -442,6 +833,8 @@ public enum ZaiUsageError: LocalizedError, Sendable {
         switch self {
         case .invalidCredentials:
             "Invalid z.ai API credentials"
+        case .missingTeamContext:
+            "z.ai BigModel team usage requires both Organization ID and Project ID."
         case let .networkError(message):
             "z.ai network error: \(message)"
         case let .apiError(message):

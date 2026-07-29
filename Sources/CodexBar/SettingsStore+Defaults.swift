@@ -5,11 +5,53 @@ import ServiceManagement
 extension SettingsStore {
     private static let mergedOverviewSelectionEditedActiveProvidersKey = "mergedOverviewSelectionEditedActiveProviders"
 
+    func noteBackgroundWorkSettingsChanged() {
+        self.backgroundWorkSettingsRevision &+= 1
+    }
+
     var refreshFrequency: RefreshFrequency {
         get { self.defaultsState.refreshFrequency }
         set {
+            let previousValue = self.defaultsState.refreshFrequency
+            if newValue == .adaptiveAgentAware,
+               previousValue != .adaptiveAgentAware,
+               self.defaultsState.adaptiveActivityScanConsent == .declined
+            {
+                self.defaultsState.adaptiveActivityScanConsent = .undecided
+                self.userDefaults.set(
+                    AdaptiveActivityScanConsent.undecided.rawValue,
+                    forKey: "adaptiveActivityScanConsent")
+            }
             self.defaultsState.refreshFrequency = newValue
             self.userDefaults.set(newValue.rawValue, forKey: "refreshFrequency")
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var adaptiveActivityScanConsent: AdaptiveActivityScanConsent {
+        get { self.defaultsState.adaptiveActivityScanConsent }
+        set {
+            self.defaultsState.adaptiveActivityScanConsent = newValue
+            self.userDefaults.set(newValue.rawValue, forKey: "adaptiveActivityScanConsent")
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var adaptiveActivityScanningEnabled: Bool {
+        self.refreshFrequency == .adaptiveAgentAware && self.adaptiveActivityScanConsent == .allowed
+    }
+
+    var shouldRequestAdaptiveActivityScanConsent: Bool {
+        self.refreshFrequency == .adaptiveAgentAware && self.adaptiveActivityScanConsent == .undecided
+    }
+
+    /// When enabled, keeping the menu open through its short refresh delay fetches usage for every
+    /// enabled provider. The periodic refresh clock remains unchanged. See `scheduleOpenMenuRefresh`.
+    var refreshAllProvidersOnMenuOpen: Bool {
+        get { self.defaultsState.refreshAllProvidersOnMenuOpen }
+        set {
+            self.defaultsState.refreshAllProvidersOnMenuOpen = newValue
+            self.userDefaults.set(newValue, forKey: "refreshAllProvidersOnMenuOpen")
         }
     }
 
@@ -39,6 +81,7 @@ extension SettingsStore {
                 Self.sharedDefaults?.set(newValue, forKey: "debugDisableKeychainAccess")
             }
             KeychainAccessGate.isDisabled = newValue
+            self.noteBackgroundWorkSettingsChanged()
         }
     }
 
@@ -68,6 +111,7 @@ extension SettingsStore {
         set {
             self.defaultsState.debugKeepCLISessionsAlive = newValue
             self.userDefaults.set(newValue, forKey: "debugKeepCLISessionsAlive")
+            self.noteBackgroundWorkSettingsChanged()
         }
     }
 
@@ -92,6 +136,7 @@ extension SettingsStore {
         set {
             self.defaultsState.statusChecksEnabled = newValue
             self.userDefaults.set(newValue, forKey: "statusChecksEnabled")
+            self.noteBackgroundWorkSettingsChanged()
         }
     }
 
@@ -100,6 +145,127 @@ extension SettingsStore {
         set {
             self.defaultsState.sessionQuotaNotificationsEnabled = newValue
             self.userDefaults.set(newValue, forKey: "sessionQuotaNotificationsEnabled")
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var quotaWarningNotificationsEnabled: Bool {
+        get { self.defaultsState.quotaWarningNotificationsEnabled }
+        set {
+            self.defaultsState.quotaWarningNotificationsEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "quotaWarningNotificationsEnabled")
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var predictivePaceWarningNotificationsEnabled: Bool {
+        get { self.defaultsState.predictivePaceWarningNotificationsEnabled }
+        set {
+            guard self.defaultsState.predictivePaceWarningNotificationsEnabled != newValue else { return }
+            self.defaultsState.predictivePaceWarningNotificationsEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "predictivePaceWarningNotificationsEnabled")
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var quotaWarningThresholds: [Int] {
+        get { QuotaWarningThresholds.sanitized(self.defaultsState.quotaWarningThresholdsRaw) }
+        set {
+            let sanitized = QuotaWarningThresholds.sanitized(newValue)
+            guard QuotaWarningThresholds.sanitized(self.defaultsState.quotaWarningThresholdsRaw) != sanitized
+                || QuotaWarningThresholds.sanitized(self.defaultsState.quotaWarningSessionThresholdsRaw) != sanitized
+                || QuotaWarningThresholds.sanitized(self.defaultsState.quotaWarningWeeklyThresholdsRaw) != sanitized
+            else {
+                return
+            }
+            self.defaultsState.quotaWarningThresholdsRaw = sanitized
+            self.defaultsState.quotaWarningSessionThresholdsRaw = sanitized
+            self.defaultsState.quotaWarningWeeklyThresholdsRaw = sanitized
+            self.userDefaults.set(sanitized, forKey: "quotaWarningThresholds")
+            self.userDefaults.set(sanitized, forKey: "quotaWarningSessionThresholds")
+            self.userDefaults.set(sanitized, forKey: "quotaWarningWeeklyThresholds")
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    func quotaWarningThresholds(_ window: QuotaWarningWindow) -> [Int] {
+        switch window {
+        case .session:
+            QuotaWarningThresholds.sanitized(self.defaultsState.quotaWarningSessionThresholdsRaw)
+        case .weekly:
+            QuotaWarningThresholds.sanitized(self.defaultsState.quotaWarningWeeklyThresholdsRaw)
+        }
+    }
+
+    func setQuotaWarningThresholds(_ window: QuotaWarningWindow, thresholds: [Int]) {
+        let sanitized = QuotaWarningThresholds.sanitized(thresholds)
+        guard self.quotaWarningThresholds(window) != sanitized else { return }
+        switch window {
+        case .session:
+            self.defaultsState.quotaWarningSessionThresholdsRaw = sanitized
+            self.userDefaults.set(sanitized, forKey: "quotaWarningSessionThresholds")
+        case .weekly:
+            self.defaultsState.quotaWarningWeeklyThresholdsRaw = sanitized
+            self.userDefaults.set(sanitized, forKey: "quotaWarningWeeklyThresholds")
+        }
+        self.noteBackgroundWorkSettingsChanged()
+    }
+
+    func quotaWarningWindowEnabled(_ window: QuotaWarningWindow) -> Bool {
+        switch window {
+        case .session:
+            self.defaultsState.quotaWarningSessionEnabled
+        case .weekly:
+            self.defaultsState.quotaWarningWeeklyEnabled
+        }
+    }
+
+    func setQuotaWarningWindowEnabled(_ window: QuotaWarningWindow, enabled: Bool) {
+        switch window {
+        case .session:
+            self.defaultsState.quotaWarningSessionEnabled = enabled
+            self.userDefaults.set(enabled, forKey: "quotaWarningSessionEnabled")
+        case .weekly:
+            self.defaultsState.quotaWarningWeeklyEnabled = enabled
+            self.userDefaults.set(enabled, forKey: "quotaWarningWeeklyEnabled")
+        }
+        self.noteBackgroundWorkSettingsChanged()
+    }
+
+    var quotaWarningSoundEnabled: Bool {
+        get { self.defaultsState.quotaWarningSoundEnabled }
+        set {
+            self.defaultsState.quotaWarningSoundEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "quotaWarningSoundEnabled")
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var quotaWarningOnScreenAlertEnabled: Bool {
+        get { self.defaultsState.quotaWarningOnScreenAlertEnabled }
+        set {
+            self.defaultsState.quotaWarningOnScreenAlertEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "quotaWarningOnScreenAlertEnabled")
+        }
+    }
+
+    var quotaWarningMarkersVisible: Bool {
+        get { self.defaultsState.quotaWarningMarkersVisible }
+        set {
+            self.defaultsState.quotaWarningMarkersVisible = newValue
+            self.userDefaults.set(newValue, forKey: "quotaWarningMarkersVisible")
+        }
+    }
+
+    var weeklyProgressWorkDays: Int? {
+        get { self.defaultsState.weeklyProgressWorkDays }
+        set {
+            self.defaultsState.weeklyProgressWorkDays = newValue
+            if let newValue {
+                self.userDefaults.set(newValue, forKey: "weeklyProgressWorkDays")
+            } else {
+                self.userDefaults.removeObject(forKey: "weeklyProgressWorkDays")
+            }
         }
     }
 
@@ -119,11 +285,35 @@ extension SettingsStore {
         }
     }
 
+    var providerChangelogLinksEnabled: Bool {
+        get { self.defaultsState.providerChangelogLinksEnabled }
+        set {
+            self.defaultsState.providerChangelogLinksEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "providerChangelogLinksEnabled")
+        }
+    }
+
     var menuBarShowsBrandIconWithPercent: Bool {
         get { self.defaultsState.menuBarShowsBrandIconWithPercent }
         set {
             self.defaultsState.menuBarShowsBrandIconWithPercent = newValue
             self.userDefaults.set(newValue, forKey: "menuBarShowsBrandIconWithPercent")
+        }
+    }
+
+    var menuBarHidesCritters: Bool {
+        get { self.defaultsState.menuBarHidesCritters }
+        set {
+            self.defaultsState.menuBarHidesCritters = newValue
+            self.userDefaults.set(newValue, forKey: "menuBarHidesCritters")
+        }
+    }
+
+    var menuBarHighContrastOnInactiveDisplays: Bool {
+        get { self.defaultsState.menuBarHighContrastOnInactiveDisplays }
+        set {
+            self.defaultsState.menuBarHighContrastOnInactiveDisplays = newValue
+            self.userDefaults.set(newValue, forKey: "menuBarHighContrastOnInactiveDisplays")
         }
     }
 
@@ -144,12 +334,43 @@ extension SettingsStore {
         set { self.menuBarDisplayModeRaw = newValue.rawValue }
     }
 
-    var showAllTokenAccountsInMenu: Bool {
-        get { self.defaultsState.showAllTokenAccountsInMenu }
+    var menuBarShowsResetTimeWhenExhausted: Bool {
+        get { self.defaultsState.menuBarShowsResetTimeWhenExhausted }
         set {
-            self.defaultsState.showAllTokenAccountsInMenu = newValue
-            self.userDefaults.set(newValue, forKey: "showAllTokenAccountsInMenu")
+            self.defaultsState.menuBarShowsResetTimeWhenExhausted = newValue
+            self.userDefaults.set(newValue, forKey: "menuBarShowsResetTimeWhenExhausted")
         }
+    }
+
+    private var kiroMenuBarDisplayModeRaw: String? {
+        get { self.defaultsState.kiroMenuBarDisplayModeRaw }
+        set {
+            self.defaultsState.kiroMenuBarDisplayModeRaw = newValue
+            if let raw = newValue {
+                self.userDefaults.set(raw, forKey: "kiroMenuBarDisplayMode")
+            } else {
+                self.userDefaults.removeObject(forKey: "kiroMenuBarDisplayMode")
+            }
+        }
+    }
+
+    var kiroMenuBarDisplayMode: KiroMenuBarDisplayMode {
+        get { KiroMenuBarDisplayMode(rawValue: self.kiroMenuBarDisplayModeRaw ?? "") ?? .automatic }
+        set { self.kiroMenuBarDisplayModeRaw = newValue.rawValue }
+    }
+
+    var multiAccountMenuLayout: MultiAccountMenuLayout {
+        get { MultiAccountMenuLayout(rawValue: self.defaultsState.multiAccountMenuLayoutRaw) ?? .segmented }
+        set {
+            self.defaultsState.multiAccountMenuLayoutRaw = newValue.rawValue
+            self.userDefaults.set(newValue.rawValue, forKey: "multiAccountMenuLayout")
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var showAllTokenAccountsInMenu: Bool {
+        get { self.multiAccountMenuLayout == .stacked }
+        set { self.multiAccountMenuLayout = newValue ? .stacked : .segmented }
     }
 
     var historicalTrackingEnabled: Bool {
@@ -157,6 +378,7 @@ extension SettingsStore {
         set {
             self.defaultsState.historicalTrackingEnabled = newValue
             self.userDefaults.set(newValue, forKey: "historicalTrackingEnabled")
+            self.noteBackgroundWorkSettingsChanged()
         }
     }
 
@@ -168,12 +390,160 @@ extension SettingsStore {
         }
     }
 
+    var menuBarLayout: MenuBarLayout {
+        get {
+            self.defaultsState.storedMenuBarLayout ?? MenuBarLayout.migrated(
+                iconStyle: self.menuBarIconStyle,
+                displayMode: self.menuBarDisplayMode,
+                metricPreference: .automatic,
+                resetTimeDisplayStyle: self.resetTimeDisplayStyle)
+        }
+        set {
+            self.defaultsState.storedMenuBarLayout = newValue
+            self.persistMenuBarLayout(newValue, key: "menuBarLayout")
+        }
+    }
+
+    var hasStoredMenuBarLayout: Bool {
+        self.defaultsState.storedMenuBarLayout != nil
+    }
+
+    var menuBarLayoutOverrides: [UsageProvider: MenuBarLayout] {
+        Dictionary(uniqueKeysWithValues: self.defaultsState.menuBarLayoutOverridesRaw.compactMap { key, value in
+            UsageProvider(rawValue: key).map { ($0, value) }
+        })
+    }
+
+    func menuBarLayout(for provider: UsageProvider) -> MenuBarLayout {
+        self.menuBarLayoutResolution(for: provider).layout
+    }
+
+    func menuBarLayoutForGlobalEditing(representativeProvider: UsageProvider?) -> MenuBarLayout {
+        if let stored = self.defaultsState.storedMenuBarLayout {
+            return stored
+        }
+        guard let representativeProvider else { return self.menuBarLayout }
+        return self.menuBarLayoutResolution(for: representativeProvider).layout
+    }
+
+    func menuBarLayoutResolution(for provider: UsageProvider) -> MenuBarLayoutResolution {
+        if let override = self.defaultsState.menuBarLayoutOverridesRaw[provider.rawValue] {
+            return .stored(override)
+        }
+        if let stored = self.defaultsState.storedMenuBarLayout {
+            return .stored(stored)
+        }
+        return .legacy(
+            iconStyle: self.menuBarIconStyle,
+            displayMode: self.menuBarDisplayMode,
+            metricPreference: self.menuBarMetricPreference(for: provider),
+            resetTimeDisplayStyle: self.resetTimeDisplayStyle,
+            provider: provider)
+    }
+
+    func setMenuBarLayout(_ layout: MenuBarLayout, for provider: UsageProvider?) {
+        if let provider {
+            self.defaultsState.menuBarLayoutOverridesRaw[provider.rawValue] = layout
+            self.persistMenuBarLayoutOverrides()
+        } else {
+            self.menuBarLayout = layout
+        }
+    }
+
+    func removeMenuBarLayoutOverride(for provider: UsageProvider) {
+        guard self.defaultsState.menuBarLayoutOverridesRaw.removeValue(forKey: provider.rawValue) != nil else { return }
+        self.persistMenuBarLayoutOverrides()
+    }
+
+    var menuBarLayoutSize: MenuBarLayoutSize {
+        get { MenuBarLayoutSize(rawValue: self.defaultsState.menuBarLayoutSizeRaw) ?? .regular }
+        set {
+            self.defaultsState.menuBarLayoutSizeRaw = newValue.rawValue
+            self.userDefaults.set(newValue.rawValue, forKey: "menuBarLayoutSize")
+        }
+    }
+
+    var menuBarLayoutGap: MenuBarLayoutGap {
+        get { MenuBarLayoutGap(rawValue: self.defaultsState.menuBarLayoutGapRaw) ?? .regular }
+        set {
+            self.defaultsState.menuBarLayoutGapRaw = newValue.rawValue
+            self.userDefaults.set(newValue.rawValue, forKey: "menuBarLayoutGap")
+        }
+    }
+
+    private func persistMenuBarLayout(_ layout: MenuBarLayout, key: String) {
+        guard let data = try? JSONEncoder().encode(layout) else { return }
+        self.userDefaults.set(data, forKey: key)
+    }
+
+    private func persistMenuBarLayoutOverrides() {
+        guard let data = try? JSONEncoder().encode(self.defaultsState.menuBarLayoutOverridesRaw) else { return }
+        self.userDefaults.set(data, forKey: "menuBarLayoutOverrides")
+    }
+
+    var copilotIconSecondaryWindowIDRaw: String {
+        get { self.defaultsState.copilotIconSecondaryWindowIDRaw }
+        set {
+            self.defaultsState.copilotIconSecondaryWindowIDRaw = newValue
+            self.userDefaults.set(newValue, forKey: "copilotIconSecondaryWindowID")
+        }
+    }
+
     var costUsageEnabled: Bool {
         get { self.defaultsState.costUsageEnabled }
         set {
+            let changed = self.defaultsState.costUsageEnabled != newValue
             self.defaultsState.costUsageEnabled = newValue
             self.userDefaults.set(newValue, forKey: "tokenCostUsageEnabled")
+            if changed {
+                self.costUsageSettingsRevision &+= 1
+            }
+            self.noteBackgroundWorkSettingsChanged()
         }
+    }
+
+    var codexLocalSessionCostLedgerEnabled: Bool {
+        get { self.defaultsState.codexLocalSessionCostLedgerEnabled }
+        set {
+            self.defaultsState.codexLocalSessionCostLedgerEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "codexLocalSessionCostLedgerEnabled")
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var costUsageHistoryDays: Int {
+        get { self.defaultsState.costUsageHistoryDays }
+        set {
+            let clamped = max(1, min(365, newValue))
+            let changed = self.defaultsState.costUsageHistoryDays != clamped
+            self.defaultsState.costUsageHistoryDays = clamped
+            self.userDefaults.set(clamped, forKey: "tokenCostUsageHistoryDays")
+            if changed {
+                self.costUsageSettingsRevision &+= 1
+            }
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var costComparisonPeriodsEnabled: Bool {
+        get { self.defaultsState.costComparisonPeriodsEnabled }
+        set {
+            self.defaultsState.costComparisonPeriodsEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "costComparisonPeriodsEnabled")
+        }
+    }
+
+    var costSummaryDisplayStyleRaw: String {
+        get { self.defaultsState.costSummaryDisplayStyleRaw }
+        set {
+            self.defaultsState.costSummaryDisplayStyleRaw = newValue
+            self.userDefaults.set(newValue, forKey: "costSummaryDisplayStyle")
+        }
+    }
+
+    var costSummaryDisplayStyle: CostSummaryDisplayStyle {
+        get { CostSummaryDisplayStyle(rawValue: self.costSummaryDisplayStyleRaw) ?? .both }
+        set { self.costSummaryDisplayStyleRaw = newValue.rawValue }
     }
 
     var hidePersonalInfo: Bool {
@@ -189,6 +559,14 @@ extension SettingsStore {
         set {
             self.defaultsState.randomBlinkEnabled = newValue
             self.userDefaults.set(newValue, forKey: "randomBlinkEnabled")
+        }
+    }
+
+    var confettiOnSessionLimitResetsEnabled: Bool {
+        get { self.defaultsState.confettiOnSessionLimitResetsEnabled }
+        set {
+            self.defaultsState.confettiOnSessionLimitResetsEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "confettiOnSessionLimitResetsEnabled")
         }
     }
 
@@ -216,34 +594,52 @@ extension SettingsStore {
         set {
             self.defaultsState.claudeOAuthKeychainPromptModeRaw = newValue.rawValue
             self.userDefaults.set(newValue.rawValue, forKey: "claudeOAuthKeychainPromptMode")
+            self.noteBackgroundWorkSettingsChanged()
         }
     }
 
     var claudeOAuthKeychainReadStrategy: ClaudeOAuthKeychainReadStrategy {
         get {
             guard let raw = self.defaultsState.claudeOAuthKeychainReadStrategyRaw else {
-                return .securityCLIExperimental
+                return .securityFramework
             }
-            return ClaudeOAuthKeychainReadStrategy(rawValue: raw) ?? .securityFramework
+            let strategy = ClaudeOAuthKeychainReadStrategy(rawValue: raw) ?? .securityFramework
+            return strategy == .securityCLIExperimental ? .securityFramework : strategy
         }
         set {
             self.defaultsState.claudeOAuthKeychainReadStrategyRaw = newValue.rawValue
             self.userDefaults.set(newValue.rawValue, forKey: "claudeOAuthKeychainReadStrategy")
+            self.noteBackgroundWorkSettingsChanged()
         }
     }
 
     var claudeOAuthPromptFreeCredentialsEnabled: Bool {
-        get { self.claudeOAuthKeychainReadStrategy == .securityCLIExperimental }
+        get { self.claudeOAuthKeychainPromptMode == .never }
         set {
-            self.claudeOAuthKeychainReadStrategy = newValue
-                ? .securityCLIExperimental
-                : .securityFramework
+            self.claudeOAuthKeychainReadStrategy = .securityFramework
+            if newValue {
+                self.claudeOAuthKeychainPromptMode = .never
+            } else if self.claudeOAuthKeychainPromptMode == .never {
+                self.claudeOAuthKeychainPromptMode = .onlyOnUserAction
+            }
         }
     }
 
     var claudeWebExtrasEnabled: Bool {
         get { self.claudeWebExtrasEnabledRaw }
         set { self.claudeWebExtrasEnabledRaw = newValue }
+    }
+
+    var copilotBudgetExtrasEnabled: Bool {
+        get { self.defaultsState.copilotBudgetExtrasEnabled }
+        set {
+            self.defaultsState.copilotBudgetExtrasEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "copilotBudgetExtrasEnabled")
+            CodexBarLog.logger(LogCategories.settings).info(
+                "Copilot budget extras updated",
+                metadata: ["enabled": newValue ? "1" : "0"])
+            self.noteBackgroundWorkSettingsChanged()
+        }
     }
 
     private var claudeWebExtrasEnabledRaw: Bool {
@@ -254,14 +650,7 @@ extension SettingsStore {
             CodexBarLog.logger(LogCategories.settings).info(
                 "Claude web extras updated",
                 metadata: ["enabled": newValue ? "1" : "0"])
-        }
-    }
-
-    var claudePeakHoursEnabled: Bool {
-        get { self.defaultsState.claudePeakHoursEnabled }
-        set {
-            self.defaultsState.claudePeakHoursEnabled = newValue
-            self.userDefaults.set(newValue, forKey: "claudePeakHoursEnabled")
+            self.noteBackgroundWorkSettingsChanged()
         }
     }
 
@@ -270,6 +659,24 @@ extension SettingsStore {
         set {
             self.defaultsState.showOptionalCreditsAndExtraUsage = newValue
             self.userDefaults.set(newValue, forKey: "showOptionalCreditsAndExtraUsage")
+            // This flag also controls ProviderFetchContext.includeOptionalUsage, so it is not display-only.
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var claudeDailyRoutinesUsageVisible: Bool {
+        get { self.defaultsState.claudeDailyRoutinesUsageVisible }
+        set {
+            self.defaultsState.claudeDailyRoutinesUsageVisible = newValue
+            self.userDefaults.set(newValue, forKey: "claudeDailyRoutinesUsageVisible")
+        }
+    }
+
+    var codexSparkUsageVisible: Bool {
+        get { self.defaultsState.codexSparkUsageVisible }
+        set {
+            self.defaultsState.codexSparkUsageVisible = newValue
+            self.userDefaults.set(newValue, forKey: "codexSparkUsageVisible")
         }
     }
 
@@ -281,6 +688,7 @@ extension SettingsStore {
             CodexBarLog.logger(LogCategories.settings).info(
                 "OpenAI web access updated",
                 metadata: ["enabled": newValue ? "1" : "0"])
+            self.noteBackgroundWorkSettingsChanged()
         }
     }
 
@@ -292,6 +700,19 @@ extension SettingsStore {
             CodexBarLog.logger(LogCategories.settings).info(
                 "OpenAI web battery saver updated",
                 metadata: ["enabled": newValue ? "1" : "0"])
+            self.noteBackgroundWorkSettingsChanged()
+        }
+    }
+
+    var providerStorageFootprintsEnabled: Bool {
+        get { self.defaultsState.providerStorageFootprintsEnabled }
+        set {
+            self.defaultsState.providerStorageFootprintsEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "providerStorageFootprintsEnabled")
+            CodexBarLog.logger(LogCategories.settings).info(
+                "Provider storage footprints updated",
+                metadata: ["enabled": newValue ? "1" : "0"])
+            self.noteBackgroundWorkSettingsChanged()
         }
     }
 
@@ -320,9 +741,9 @@ extension SettingsStore {
     }
 
     var mergedMenuLastSelectedWasOverview: Bool {
-        get { self.defaultsState.mergedMenuLastSelectedWasOverview }
+        get { self.mergedMenuLastSelectedWasOverviewStorage }
         set {
-            self.defaultsState.mergedMenuLastSelectedWasOverview = newValue
+            self.mergedMenuLastSelectedWasOverviewStorage = newValue
             self.userDefaults.set(newValue, forKey: "mergedMenuLastSelectedWasOverview")
         }
     }
@@ -336,9 +757,9 @@ extension SettingsStore {
     }
 
     private var selectedMenuProviderRaw: String? {
-        get { self.defaultsState.selectedMenuProviderRaw }
+        get { self.selectedMenuProviderRawStorage }
         set {
-            self.defaultsState.selectedMenuProviderRaw = newValue
+            self.selectedMenuProviderRawStorage = newValue
             if let raw = newValue {
                 self.userDefaults.set(raw, forKey: "selectedMenuProvider")
             } else {
@@ -524,9 +945,74 @@ extension SettingsStore {
         }
     }
 
+    /// Whether the Providers settings pane displays providers sorted alphabetically (enabled on
+    /// top). Defaults to `false`. Purely a display preference — it never rewrites the stored manual
+    /// order, so turning it on sorts the display without losing the user's hand-arranged sequence.
+    var providersSortedAlphabetically: Bool {
+        get { self.defaultsState.providersSortedAlphabetically }
+        set {
+            self.defaultsState.providersSortedAlphabetically = newValue
+            self.userDefaults.set(newValue, forKey: "providersSortedAlphabetically")
+        }
+    }
+
+    var appLanguage: String {
+        get { self.defaultsState.appLanguageRaw ?? "" }
+        set {
+            let stored = newValue.isEmpty ? nil : newValue
+            self.defaultsState.appLanguageRaw = stored
+            if let stored {
+                self.userDefaults.set(stored, forKey: "appLanguage")
+                if self.userDefaults !== UserDefaults.standard {
+                    UserDefaults.standard.set(stored, forKey: "appLanguage")
+                }
+                UserDefaults.standard.removeObject(forKey: "AppleLanguages")
+            } else {
+                self.userDefaults.removeObject(forKey: "appLanguage")
+                if self.userDefaults !== UserDefaults.standard {
+                    UserDefaults.standard.removeObject(forKey: "appLanguage")
+                }
+                UserDefaults.standard.removeObject(forKey: "AppleLanguages")
+            }
+            resetCodexBarLocalizationCache()
+        }
+    }
+
     var debugLoadingPattern: LoadingPattern? {
         get { self.debugLoadingPatternRaw.flatMap(LoadingPattern.init(rawValue:)) }
         set { self.debugLoadingPatternRaw = newValue?.rawValue }
+    }
+
+    var terminalApp: TerminalApp {
+        get { TerminalApp(rawValue: self.defaultsState.terminalAppRaw ?? "") ?? .terminal }
+        set {
+            self.defaultsState.terminalAppRaw = newValue.rawValue
+            self.userDefaults.set(newValue.rawValue, forKey: "terminalApp")
+        }
+    }
+
+    var agentSessionsEnabled: Bool {
+        get { self.defaultsState.agentSessionsEnabled }
+        set {
+            self.defaultsState.agentSessionsEnabled = newValue
+            self.userDefaults.set(newValue, forKey: "agentSessionsEnabled")
+        }
+    }
+
+    var agentSessionLabelStyle: AgentSessionLabelStyle {
+        get { AgentSessionLabelStyle(rawValue: self.defaultsState.agentSessionLabelStyleRaw) ?? .project }
+        set {
+            self.defaultsState.agentSessionLabelStyleRaw = newValue.rawValue
+            self.userDefaults.set(newValue.rawValue, forKey: "agentSessionLabelStyle")
+        }
+    }
+
+    var agentSessionsManualHosts: String {
+        get { self.defaultsState.agentSessionsManualHosts }
+        set {
+            self.defaultsState.agentSessionsManualHosts = newValue
+            self.userDefaults.set(newValue, forKey: "agentSessionsManualHosts")
+        }
     }
 }
 
@@ -537,7 +1023,9 @@ extension SettingsStore {
         for provider in providers where !seen.contains(provider) {
             seen.insert(provider)
             normalized.append(provider)
-            if let maxCount, normalized.count >= maxCount { break }
+            if let maxCount, normalized.count >= maxCount {
+                break
+            }
         }
         return normalized
     }

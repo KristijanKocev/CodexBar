@@ -1,9 +1,8 @@
-import CodexBarMacroSupport
 import Foundation
 
-@ProviderDescriptorRegistration
-@ProviderDescriptorDefinition
 public enum OllamaProviderDescriptor {
+    public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
+
     static func makeDescriptor() -> ProviderDescriptor {
         ProviderDescriptor(
             id: .ollama,
@@ -27,16 +26,40 @@ public enum OllamaProviderDescriptor {
             branding: ProviderBranding(
                 iconStyle: .ollama,
                 iconResourceName: "ProviderIcon-ollama",
-                color: ProviderColor(red: 136 / 255, green: 136 / 255, blue: 136 / 255)),
+                color: ProviderColor(red: 136 / 255, green: 136 / 255, blue: 136 / 255),
+                confettiPalette: [
+                    ProviderColor(hex: 0x000000),
+                    ProviderColor(hex: 0xFFFFFF),
+                ]),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Ollama cost summary is not supported." }),
             fetchPlan: ProviderFetchPlan(
-                sourceModes: [.auto, .web],
-                pipeline: ProviderFetchPipeline(resolveStrategies: { _ in [OllamaStatusFetchStrategy()] })),
+                sourceModes: [.auto, .web, .api],
+                pipeline: ProviderFetchPipeline(resolveStrategies: self.resolveStrategies)),
             cli: ProviderCLIConfig(
                 name: "ollama",
                 versionDetector: nil))
+    }
+
+    private static func resolveStrategies(context: ProviderFetchContext) async -> [any ProviderFetchStrategy] {
+        switch context.sourceMode {
+        case .web:
+            return [OllamaStatusFetchStrategy()]
+        case .api:
+            return [OllamaAPIFetchStrategy()]
+        case .cli, .oauth:
+            return []
+        case .auto:
+            break
+        }
+        if context.settings?.ollama?.cookieSource == .off {
+            return [OllamaAPIFetchStrategy()]
+        }
+        if ProviderTokenResolver.ollamaToken(environment: context.env) != nil {
+            return [OllamaStatusFetchStrategy(), OllamaAPIFetchStrategy()]
+        }
+        return [OllamaStatusFetchStrategy()]
     }
 }
 
@@ -56,21 +79,123 @@ struct OllamaStatusFetchStrategy: ProviderFetchStrategy {
         let logger: ((String) -> Void)? = context.verbose
             ? { msg in CodexBarLog.logger(LogCategories.ollama).verbose(msg) }
             : nil
-        let snap = try await fetcher.fetch(
-            cookieHeaderOverride: manual,
-            manualCookieMode: isManualMode,
-            logger: logger)
+        let snap: OllamaUsageSnapshot = if isManualMode {
+            try await fetcher.fetch(
+                cookieHeaderOverride: manual,
+                manualCookieMode: true,
+                logger: logger)
+        } else {
+            try await Self.fetchAutomatic(
+                cached: CookieHeaderCache.load(provider: .ollama),
+                fetchCached: { cached in
+                    try await fetcher.fetchResolvedCookie(
+                        cookieHeaderOverride: cached.cookieHeader,
+                        cookieHeaderOverrideSourceLabel: "cached \(cached.sourceLabel)",
+                        logger: logger).snapshot
+                },
+                fetchBrowser: {
+                    try await fetcher.fetchResolvedCookie(logger: logger)
+                },
+                clearCached: { cached in
+                    _ = CookieHeaderCache.clearIfCurrent(provider: .ollama, expected: cached)
+                },
+                storeResolved: { resolved in
+                    CookieHeaderCache.store(
+                        provider: .ollama,
+                        cookieHeader: resolved.cookieHeader,
+                        sourceLabel: resolved.sourceLabel)
+                })
+        }
         return self.makeResult(
             usage: snap.toUsageSnapshot(),
             sourceLabel: "web")
     }
 
-    func shouldFallback(on _: Error, context _: ProviderFetchContext) -> Bool {
-        false
+    func shouldFallback(on _: Error, context: ProviderFetchContext) -> Bool {
+        context.sourceMode == .auto
+            && ProviderTokenResolver.ollamaToken(environment: context.env) != nil
     }
 
-    private static func manualCookieHeader(from context: ProviderFetchContext) -> String? {
+    static func manualCookieHeader(from context: ProviderFetchContext) -> String? {
         guard context.settings?.ollama?.cookieSource == .manual else { return nil }
-        return CookieHeaderNormalizer.normalize(context.settings?.ollama?.manualCookieHeader)
+        return context.settings?.ollama?.manualCookieHeader
+    }
+
+    static func fetchAutomatic(
+        cached: CookieHeaderCache.Entry?,
+        fetchCached: (CookieHeaderCache.Entry) async throws -> OllamaUsageSnapshot,
+        fetchBrowser: () async throws -> OllamaUsageFetcher.ResolvedCookieFetch,
+        clearCached: (CookieHeaderCache.Entry) -> Void,
+        storeResolved: (OllamaUsageFetcher.ResolvedCookieFetch) -> Void) async throws -> OllamaUsageSnapshot
+    {
+        if let cached {
+            do {
+                return try await fetchCached(cached)
+            } catch {
+                if self.shouldInvalidateCachedCookie(after: error) {
+                    clearCached(cached)
+                } else if self.shouldTryBrowserCandidates(afterCachedFailure: error) {
+                    let cachedError = error
+                    do {
+                        let resolved = try await fetchBrowser()
+                        storeResolved(resolved)
+                        return resolved.snapshot
+                    } catch {
+                        throw cachedError
+                    }
+                } else {
+                    throw error
+                }
+            }
+        }
+
+        let resolved = try await fetchBrowser()
+        storeResolved(resolved)
+        return resolved.snapshot
+    }
+
+    static func shouldInvalidateCachedCookie(after error: Error) -> Bool {
+        switch error {
+        case OllamaUsageError.invalidCredentials, OllamaUsageError.notLoggedIn:
+            true
+        default:
+            false
+        }
+    }
+
+    static func shouldTryBrowserCandidates(afterCachedFailure error: Error) -> Bool {
+        switch error {
+        case let OllamaUsageError.parseFailed(message):
+            message == "Missing Ollama usage data."
+        default:
+            false
+        }
+    }
+}
+
+struct OllamaAPIFetchStrategy: ProviderFetchStrategy {
+    let id: String = "ollama.api"
+    let kind: ProviderFetchKind = .apiToken
+
+    func isAvailable(_ context: ProviderFetchContext) async -> Bool {
+        Self.resolveToken(environment: context.env) != nil
+    }
+
+    func fetch(_ context: ProviderFetchContext) async throws -> ProviderFetchResult {
+        guard let apiKey = Self.resolveToken(environment: context.env) else {
+            throw OllamaUsageError.missingAPIKey
+        }
+        let snapshot = try await OllamaAPIUsageFetcher.fetchUsage(apiKey: apiKey)
+        return self.makeResult(
+            usage: snapshot.toUsageSnapshot(),
+            sourceLabel: "api")
+    }
+
+    func shouldFallback(on _: Error, context: ProviderFetchContext) -> Bool {
+        context.sourceMode == .auto
+    }
+
+    private static func resolveToken(environment: [String: String]) -> String? {
+        ProviderTokenResolver.ollamaToken(environment: environment)
     }
 }

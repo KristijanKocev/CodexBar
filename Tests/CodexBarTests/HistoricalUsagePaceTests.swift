@@ -286,6 +286,44 @@ struct HistoricalUsagePaceTests {
     }
 
     @Test
+    func `history store backfill is idempotent across minute scale reset jitter`() async {
+        let fileURL = Self.makeTempURL()
+        let store = HistoricalUsageHistoryStore(fileURL: fileURL)
+        let now = Date(timeIntervalSince1970: 1_770_000_000)
+        let windowMinutes = 10080
+        let canonicalReset = Self.normalizeReset(now.addingTimeInterval(2 * 24 * 60 * 60))
+        let firstWindow = RateWindow(
+            usedPercent: 50,
+            windowMinutes: windowMinutes,
+            resetsAt: canonicalReset.addingTimeInterval(-90),
+            resetDescription: nil)
+        let secondWindow = RateWindow(
+            usedPercent: 50,
+            windowMinutes: windowMinutes,
+            resetsAt: canonicalReset.addingTimeInterval(90),
+            resetDescription: nil)
+
+        let breakdown = Self.syntheticBreakdown(endingAt: now, days: 35, dailyCredits: 10)
+        let first = await store.backfillCodexWeeklyFromUsageBreakdown(
+            breakdown,
+            referenceWindow: firstWindow,
+            now: now,
+            accountKey: nil)
+        let recordsAfterFirst = (try? Self.readHistoricalRecords(from: fileURL)) ?? []
+        let second = await store.backfillCodexWeeklyFromUsageBreakdown(
+            breakdown,
+            referenceWindow: secondWindow,
+            now: now,
+            accountKey: nil)
+        let recordsAfterSecond = (try? Self.readHistoricalRecords(from: fileURL)) ?? []
+
+        #expect((first?.weeks.count ?? 0) >= 3)
+        #expect(first?.weeks.count == second?.weeks.count)
+        #expect(recordsAfterSecond.count == recordsAfterFirst.count)
+        #expect(Self.datasetCurveSignature(first) == Self.datasetCurveSignature(second))
+    }
+
+    @Test
     func `history store backfill fills incomplete existing week`() async {
         let fileURL = Self.makeTempURL()
         let store = HistoricalUsageHistoryStore(fileURL: fileURL)
@@ -358,7 +396,7 @@ struct HistoricalUsagePaceTests {
         let store = HistoricalUsageHistoryStore(fileURL: fileURL)
         let windowMinutes = 10080
         let duration = TimeInterval(windowMinutes) * 60
-        let canonicalReset = Date(timeIntervalSince1970: 1_770_000_000)
+        let canonicalReset = Self.normalizeReset(Date(timeIntervalSince1970: 1_770_000_000))
         let windowStart = canonicalReset.addingTimeInterval(-duration)
 
         let samples: [(u: Double, used: Double)] = [
@@ -370,7 +408,7 @@ struct HistoricalUsagePaceTests {
             (0.98, 95),
         ]
         for (index, sample) in samples.enumerated() {
-            let jitteredReset = canonicalReset.addingTimeInterval(index.isMultiple(of: 2) ? -20 : 20)
+            let jitteredReset = canonicalReset.addingTimeInterval(index.isMultiple(of: 2) ? -100 : 100)
             _ = await store.recordCodexWeekly(
                 window: RateWindow(
                     usedPercent: sample.used,
@@ -400,7 +438,7 @@ struct HistoricalUsagePaceTests {
             window: RateWindow(
                 usedPercent: 35,
                 windowMinutes: windowMinutes,
-                resetsAt: targetReset.addingTimeInterval(30),
+                resetsAt: targetReset.addingTimeInterval(120),
                 resetDescription: nil),
             sampledAt: targetStart.addingTimeInterval(duration * 0.5),
             accountKey: nil)
@@ -710,5 +748,76 @@ struct HistoricalUsagePaceTests {
 
         try await Task.sleep(for: .milliseconds(250))
         #expect(store.codexHistoricalDataset == nil)
+    }
+
+    @Test
+    func `exhausted historical weeks extend linearly and don't flatline at 100`() throws {
+        // Build a historical dataset where a week reaches 100% at u = 0.5
+        var earlyExhaustedCurve = [Double]()
+        for i in 0..<CodexHistoricalDataset.gridPointCount {
+            let u = Double(i) / Double(CodexHistoricalDataset.gridPointCount - 1)
+            if u <= 0.5 {
+                earlyExhaustedCurve.append((u / 0.5) * 100)
+            } else {
+                earlyExhaustedCurve.append(100)
+            }
+        }
+        let now = Date()
+        let week = HistoricalWeekProfile(
+            resetsAt: now.addingTimeInterval(-10080 * 60),
+            windowMinutes: 10080,
+            curve: earlyExhaustedCurve)
+        let dataset = CodexHistoricalDataset(weeks: [week, week, week, week, week])
+
+        let window = RateWindow(
+            usedPercent: 80,
+            windowMinutes: 10080,
+            resetsAt: now.addingTimeInterval(0.25 * 10080 * 60),
+            resetDescription: nil)
+
+        let pace = try #require(CodexHistoricalPaceEvaluator.evaluate(
+            window: window,
+            now: now,
+            dataset: dataset))
+
+        #expect(pace.willLastToReset == false)
+        #expect(pace.runOutProbability != nil)
+        #expect(try #require(pace.runOutProbability) > 0)
+        #expect(pace.deltaPercent > 0)
+
+        let detail = UsagePaceText.weeklyDetail(provider: .codex, pace: pace, now: now)
+        #expect(detail.leftLabel == "5% in deficit")
+        #expect(detail.rightLabel?.contains("Lasts until reset") == false)
+    }
+
+    @Test
+    func `exhausted actual returns zero eta`() throws {
+        let now = Date()
+        let resetsAt = now.addingTimeInterval(3600)
+        let week = HistoricalWeekProfile(
+            resetsAt: now.addingTimeInterval(-10080 * 60),
+            windowMinutes: 10080,
+            curve: Array(repeating: 100.0, count: 169))
+        let dataset = CodexHistoricalDataset(weeks: [week, week, week])
+
+        for usedPercent in [100.0, 120.0] {
+            let window = RateWindow(
+                usedPercent: usedPercent,
+                windowMinutes: 10080,
+                resetsAt: resetsAt,
+                resetDescription: nil,
+                nextRegenPercent: nil)
+
+            let pace = try #require(CodexHistoricalPaceEvaluator.evaluate(
+                window: window,
+                now: now,
+                dataset: dataset))
+            #expect(pace.willLastToReset == false)
+            #expect(pace.etaSeconds == 0)
+            #expect(pace.runOutProbability == 1)
+
+            let detail = UsagePaceText.weeklyDetail(provider: .codex, pace: pace, now: now)
+            #expect(detail.rightLabel == "Runs out now · ≈ 100% run-out risk")
+        }
     }
 }

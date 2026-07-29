@@ -36,15 +36,19 @@ public enum CodexOpenAIWorkspaceResolver {
 
     private static let accountsURL = URL(string: "https://chatgpt.com/backend-api/accounts")!
 
+    public static func resolve(credentials: CodexOAuthCredentials) async throws -> CodexOpenAIWorkspaceIdentity? {
+        try await self.resolve(credentials: credentials, session: CodexAuthenticatedHTTPTransport.current)
+    }
+
     public static func resolve(
         credentials: CodexOAuthCredentials,
-        session: URLSession = .shared) async throws -> CodexOpenAIWorkspaceIdentity?
+        session transport: any ProviderHTTPTransport) async throws -> CodexOpenAIWorkspaceIdentity?
     {
         guard let workspaceAccountID = normalizeWorkspaceAccountID(credentials.accountId) else {
             return nil
         }
 
-        let identities = try await self.listWorkspaces(credentials: credentials, session: session)
+        let identities = try await self.listWorkspaces(credentials: credentials, session: transport)
         if let identity = identities.first(where: { $0.workspaceAccountID == workspaceAccountID }) {
             return identity
         }
@@ -55,12 +59,20 @@ public enum CodexOpenAIWorkspaceResolver {
     }
 
     public static func listWorkspaces(
-        credentials: CodexOAuthCredentials,
-        session: URLSession = .shared) async throws -> [CodexOpenAIWorkspaceIdentity]
+        credentials: CodexOAuthCredentials) async throws -> [CodexOpenAIWorkspaceIdentity]
     {
-        var request = URLRequest(url: self.accountsURL)
+        try await self.listWorkspaces(credentials: credentials, session: CodexAuthenticatedHTTPTransport.current)
+    }
+
+    public static func listWorkspaces(
+        credentials: CodexOAuthCredentials,
+        session transport: any ProviderHTTPTransport) async throws -> [CodexOpenAIWorkspaceIdentity]
+    {
+        var request = URLRequest(
+            url: self.accountsURL,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: 20)
         request.httpMethod = "GET"
-        request.timeoutInterval = 20
         request.setValue("Bearer \(credentials.accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("codex-cli", forHTTPHeaderField: "User-Agent")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -68,14 +80,13 @@ public enum CodexOpenAIWorkspaceResolver {
             request.setValue(workspaceAccountID, forHTTPHeaderField: "ChatGPT-Account-Id")
         }
 
-        let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200..<300).contains(httpResponse.statusCode)
+        let response = try await transport.response(for: request)
+        guard (200..<300).contains(response.statusCode)
         else {
             throw CodexOpenAIWorkspaceResolverError.invalidResponse
         }
 
-        let decoded = try JSONDecoder().decode(AccountsResponse.self, from: data)
+        let decoded = try JSONDecoder().decode(AccountsResponse.self, from: response.data)
         return decoded.items.compactMap { account in
             guard let workspaceAccountID = self.normalizeWorkspaceAccountID(account.id) else { return nil }
             return CodexOpenAIWorkspaceIdentity(
