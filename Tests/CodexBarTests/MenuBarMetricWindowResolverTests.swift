@@ -75,7 +75,7 @@ struct MenuBarMetricWindowResolverTests {
     }
 
     @Test
-    func `automatic metric skips exhausted cursor subquota when total remains usable`() {
+    func `automatic metric always uses cursor auto pool`() {
         let snapshot = UsageSnapshot(
             primary: RateWindow(usedPercent: 67, windowMinutes: 30 * 24 * 60, resetsAt: nil, resetDescription: "Total"),
             secondary: RateWindow(
@@ -92,8 +92,8 @@ struct MenuBarMetricWindowResolverTests {
             snapshot: snapshot,
             supportsAverage: false)
 
-        #expect(window?.remainingPercent == 33)
-        #expect(window?.resetDescription == "Total")
+        #expect(window?.usedPercent == 34)
+        #expect(window?.resetDescription == "Auto")
     }
 
     @Test
@@ -119,10 +119,11 @@ struct MenuBarMetricWindowResolverTests {
             supportsAverage: false)
 
         #expect(window?.remainingPercent == 0)
+        #expect(window?.resetDescription == "Auto")
     }
 
     @Test
-    func `automatic metric keeps exhausted cursor total when a subquota remains usable`() {
+    func `automatic metric prefers cursor auto even when total is exhausted`() {
         let snapshot = UsageSnapshot(
             primary: RateWindow(
                 usedPercent: 100,
@@ -143,12 +144,12 @@ struct MenuBarMetricWindowResolverTests {
             snapshot: snapshot,
             supportsAverage: false)
 
-        #expect(window?.remainingPercent == 0)
-        #expect(window?.resetDescription == "Total")
+        #expect(window?.usedPercent == 60)
+        #expect(window?.resetDescription == "Auto")
     }
 
     @Test
-    func `automatic metric reports cursor exhausted when all present subquotas are exhausted`() {
+    func `automatic metric reports cursor auto when auto is exhausted`() {
         let snapshot = UsageSnapshot(
             primary: RateWindow(usedPercent: 67, windowMinutes: 30 * 24 * 60, resetsAt: nil, resetDescription: "Total"),
             secondary: RateWindow(
@@ -166,6 +167,7 @@ struct MenuBarMetricWindowResolverTests {
             supportsAverage: false)
 
         #expect(window?.remainingPercent == 0)
+        #expect(window?.resetDescription == "Auto")
     }
 
     @Test

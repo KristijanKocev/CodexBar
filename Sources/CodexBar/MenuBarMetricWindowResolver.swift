@@ -18,6 +18,16 @@ enum MenuBarMetricWindowResolver {
         -> RateWindow?
     {
         guard let snapshot else { return nil }
+        // Fork: always show Cursor Auto (1st-party / secondary) in the menu bar, never the
+        // most-constrained Total/API pick that automatic mode would otherwise surface.
+        if provider == .cursor {
+            switch preference {
+            case .extraUsage:
+                return Self.extraUsageWindow(snapshot: snapshot)
+            default:
+                return snapshot.secondary ?? snapshot.primary ?? snapshot.tertiary
+            }
+        }
         switch preference {
         case .monthlyPlan:
             return snapshot.extraRateWindows?.first { $0.id == "mistral-monthly-plan" }?.window
