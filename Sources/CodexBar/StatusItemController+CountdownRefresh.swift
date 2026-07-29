@@ -113,6 +113,9 @@ extension StatusItemController {
 
     private func menuBarRefreshProviders() -> [UsageProvider] {
         if self.shouldMergeIcons {
+            if let pairProviders = self.mergedCodexCursorStatusProvidersIfActive() {
+                return pairProviders
+            }
             return [self.primaryProviderForUnifiedIcon()]
         }
         return UsageProvider.allCases.filter(self.isVisible)

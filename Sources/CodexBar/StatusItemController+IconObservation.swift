@@ -9,11 +9,23 @@ extension StatusItemController {
         let providerSignatures: String
         let primaryProvider: UsageProvider?
         if mergeIcons {
-            let primary = self.primaryProviderForUnifiedIcon()
-            primaryProvider = primary
-            providerSignatures = self.providerStoreIconObservationSignature(
-                for: primary,
-                showBrandPercent: showBrandPercent)
+            let pairProviders = self.mergedCodexCursorStatusProvidersIfActive()
+            if let pairProviders {
+                primaryProvider = pairProviders.first
+                providerSignatures = pairProviders
+                    .map {
+                        self.providerStoreIconObservationSignature(
+                            for: $0,
+                            showBrandPercent: showBrandPercent)
+                    }
+                    .joined(separator: "||")
+            } else {
+                let primary = self.primaryProviderForUnifiedIcon()
+                primaryProvider = primary
+                providerSignatures = self.providerStoreIconObservationSignature(
+                    for: primary,
+                    showBrandPercent: showBrandPercent)
+            }
         } else {
             primaryProvider = nil
             providerSignatures = UsageProvider.allCases

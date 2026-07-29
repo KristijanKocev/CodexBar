@@ -12,6 +12,9 @@ extension StatusItemController {
     private static let loadingAnimationMaxContinuousDuration: TimeInterval = 30.0
     func needsMenuBarIconAnimation() -> Bool {
         if self.shouldMergeIcons {
+            if let pairProviders = self.mergedCodexCursorStatusProvidersIfActive() {
+                return pairProviders.contains { self.shouldAnimate(provider: $0) }
+            }
             let primaryProvider = self.primaryProviderForUnifiedIcon()
             return self.shouldAnimate(provider: primaryProvider)
         }
@@ -239,6 +242,12 @@ extension StatusItemController {
         guard let button = self.statusItem.button else { return false }
         if !bypassMergedMenuTrackingDeferral,
            self.deferMergedIconRenderDuringMenuTrackingIfNeeded() { return true }
+
+        // Hardcoded: keep Merge Icons on, but paint Codex + Cursor as icon+percent in the one item
+        // so macOS does not insert a full status-item gap between them.
+        if let pairResult = self.applyMergedCodexCursorPairContentIfNeeded() {
+            return pairResult
+        }
 
         let style = self.store.iconStyle
         let showUsed = self.settings.usageBarsShowUsed

@@ -3,6 +3,95 @@ import CodexBarCore
 import Foundation
 
 extension StatusItemController {
+    /// Providers painted side-by-side in the merged status item (Codex then Cursor).
+    static let mergedCodexCursorStatusProviders: [UsageProvider] = [.codex, .cursor]
+
+    /// Returns Codex+Cursor when the hardcoded dual status-item path is active; otherwise nil.
+    func mergedCodexCursorStatusProvidersIfActive() -> [UsageProvider]? {
+        guard self.shouldMergeIcons,
+              self.settings.menuBarShowsBrandIconWithPercent,
+              self.settings.menuBarIconStyle == .iconAndPercent
+        else { return nil }
+        let providers = Self.mergedCodexCursorStatusProviders.filter { self.isEnabled($0) }
+        return providers.count == 2 ? providers : nil
+    }
+
+    /// When Merge Icons is on and both Codex and Cursor are enabled, render both as icon+percent
+    /// inside the single unified status item (avoids the large native gap between separate items).
+    func applyMergedCodexCursorPairContentIfNeeded(now: Date = .init()) -> Bool? {
+        guard let providers = self.mergedCodexCursorStatusProvidersIfActive(),
+              let button = self.statusItem.button
+        else { return nil }
+
+        let minute = Date(timeIntervalSince1970: floor(now.timeIntervalSince1970 / 60) * 60)
+        let appearanceName = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])?.rawValue
+            ?? "default"
+        let options = MenuBarLayoutRenderOptions(
+            size: self.settings.menuBarLayoutSize,
+            highContrast: self.shouldUseHighContrastStatusItemContent,
+            showUsed: self.settings.usageBarsShowUsed,
+            appearanceName: appearanceName,
+            isDebugApp: Self.isDebugApp(bundleIdentifier: Bundle.main.bundleIdentifier),
+            now: minute)
+
+        let combined = NSMutableAttributedString()
+        var accessibilityParts: [String] = []
+        let separatorAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(
+                ofSize: self.settings.menuBarLayoutSize == .small ? 11 : NSFont.systemFontSize),
+            .foregroundColor: self.shouldUseHighContrastStatusItemContent
+                ? NSColor.labelColor
+                : NSColor.controlTextColor,
+        ]
+
+        for (index, provider) in providers.enumerated() {
+            if index > 0 {
+                // Compact gap between provider pairs (not a second NSStatusItem).
+                combined.append(NSAttributedString(string: " ", attributes: separatorAttributes))
+            }
+
+            let snapshot = self.store.snapshot(for: provider)
+            let warningFlash = self.quotaWarningFlashActive(provider: provider)
+            let icon = ProviderBrandIcon.image(for: provider).map {
+                warningFlash ? Self.quotaWarningFlashImage(base: $0) : $0
+            }
+            let data = self.menuBarLayoutRenderData(
+                provider: provider,
+                snapshot: snapshot,
+                warningFlash: warningFlash,
+                now: now)
+            let providerOptions = MenuBarLayoutRenderOptions(
+                size: options.size,
+                highContrast: options.highContrast,
+                showUsed: options.showUsed,
+                appearanceName: options.appearanceName,
+                isDebugApp: options.isDebugApp && index == providers.count - 1,
+                now: options.now)
+            let rendered = self.menuBarLayoutRenderer.render(
+                layout: MenuBarLayout.defaultLayout,
+                data: data,
+                icon: icon,
+                options: providerOptions)
+            combined.append(rendered.attributedTitle)
+            accessibilityParts.append(rendered.accessibilityLabel)
+        }
+
+        let rendered = MenuBarLayoutRenderedTitle(
+            attributedTitle: combined,
+            accessibilityLabel: accessibilityParts.joined(separator: ", "))
+        let wasCached = button.image == nil
+            && button.imagePosition == .noImage
+            && button.attributedTitle.isEqual(to: rendered.attributedTitle)
+        self.setButtonLayoutContent(rendered, for: button, statusItem: self.statusItem)
+        // Dual content is already wide; keep edge padding tight regardless of Gap setting.
+        let bounds = rendered.attributedTitle.boundingRect(
+            with: NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading])
+        self.statusItem.length = max(18, ceil(bounds.width) + 3)
+        self.noteIconPerfRender(skipped: wasCached)
+        return wasCached
+    }
+
     func applyStoredMenuBarLayoutIfNeeded(
         provider: UsageProvider,
         snapshot: UsageSnapshot?,
