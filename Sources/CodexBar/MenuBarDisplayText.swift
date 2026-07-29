@@ -8,11 +8,6 @@ enum MenuBarDisplayText {
         return UsageFormatter.percentString(percent)
     }
 
-    static func cursorRequestText(cursorRequests: CursorRequestUsage?, showUsed _: Bool) -> String? {
-        guard let requests = cursorRequests else { return nil }
-        return "\(requests.used)/\(requests.limit)"
-    }
-
     static func paceText(pace: UsagePace?) -> String? {
         guard let pace else { return nil }
         let deltaValue = Int(abs(pace.deltaPercent).rounded())
@@ -82,7 +77,6 @@ enum MenuBarDisplayText {
 
     static func displayText(
         mode: MenuBarDisplayMode,
-        provider: UsageProvider? = nil,
         percentWindow: RateWindow?,
         pace: UsagePace? = nil,
         showUsed: Bool,
@@ -110,11 +104,6 @@ enum MenuBarDisplayText {
         }
         switch mode {
         case .percent:
-            if provider == .cursor,
-               let requestText = self.cursorRequestText(cursorRequests: cursorRequests, showUsed: showUsed)
-            {
-                return requestText
-            }
             return self.percentText(window: percentWindow, showUsed: showUsed)
         case .pace:
             // Pace can be temporarily unavailable near a reset or when a provider omits window metadata.
@@ -122,16 +111,8 @@ enum MenuBarDisplayText {
             return self.paceText(pace: pace)
                 ?? self.percentText(window: percentWindow, showUsed: showUsed)
         case .both:
-            let percentPart: String? = {
-                if provider == .cursor,
-                   let requestText = self.cursorRequestText(cursorRequests: cursorRequests, showUsed: showUsed)
-                {
-                    return requestText
-                }
-                return self.percentText(window: percentWindow, showUsed: showUsed)
-            }()
-            guard let percent = percentPart else { return nil }
-            // Fall back to percent-only when pace is unavailable (e.g. Copilot, legacy Cursor plans).
+            guard let percent = percentText(window: percentWindow, showUsed: showUsed) else { return nil }
+            // Fall back to percent-only when pace is unavailable (e.g. Copilot)
             guard let paceText = Self.paceText(pace: pace) else { return percent }
             return "\(percent) · \(paceText)"
         case .resetTime:
